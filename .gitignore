@@ -1,0 +1,14 @@
+# build output
+/build/
+*.vpk
+*.elf
+
+# converter output and work files
+/converter/output/
+/converter/.venv/
+/converter/third_party/wwiser.pyz
+/converter/third_party/ww2ogg/ww2ogg
+/converter/third_party/ww2ogg/src/*.o
+
+__pycache__/
+*.pyc

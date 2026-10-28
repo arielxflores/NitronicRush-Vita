@@ -1,0 +1,29 @@
+# The PC test build: the whole game (vita/*.c) for Linux, drawing with Mesa's GLES 2 through EGL
+# (headless; it needs no window). See docs/testing.md.
+#   make -f Makefile.linux            -> build/nrpc
+#   make -f Makefile.linux ASAN=1     -> build/nrpc_asan (AddressSanitizer + UBSan)
+# Needs gcc and the EGL / GLES 2 development files (Debian/Ubuntu: libegl-dev libgles-dev).
+CC      ?= gcc
+OUT     := build
+SRC     := tools/pc/nrpc.c vita/main.c vita/gfx.c vita/hud.c vita/front.c vita/save.c vita/snd.c \
+           vita/particles.c vita/camera.c vita/ghost.c vita/scores.c vita/chase.c vita/results.c vita/cinema.c vita/io.c \
+           src/nr_pak.c src/nr_objs.c src/nr_coll.c src/nr_car.c src/nr_data.c src/nr_tricks.c src/tinf/tinflate.c
+CFLAGS  := -O1 -g -DNR_PC -DDATA='"data/"' -DNR_BUILD_LABEL='"pc"' -Itools/pc/shim -Itools/pc -Ivita -Isrc \
+           -Wall -Wno-unused-function -Wno-misleading-indentation -Wno-unused-variable -Wno-unused-but-set-variable \
+           $(EXTRA_CFLAGS)
+LIBS    ?= -lEGL -lGLESv2
+ifeq ($(ASAN),1)
+CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer
+BIN     := $(OUT)/nrpc_asan
+else
+BIN     := $(OUT)/nrpc
+endif
+
+$(BIN): $(SRC) $(wildcard vita/*.h src/*.h tools/pc/*.h tools/pc/shim/*.h)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SRC) -o $@ -rdynamic $(LIBS) -lm -lpthread
+
+clean:
+	rm -f $(OUT)/nrpc $(OUT)/nrpc_asan
+
+.PHONY: clean

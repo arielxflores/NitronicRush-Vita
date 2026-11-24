@@ -11,7 +11,10 @@
  *   autoplay_shots   with autoplay: pictures of each race's start and finish, first sparks and wing trail
  *   no_mips / rgba_tex / no_fog / no_cutout / no_cull / no_tex_cache / discard_cutout /
  *   no_transfer_wait / cg_shaders / msaa2x / msaa4x   (graphics fallbacks)
- *   no_post    draw straight to the screen (no bloom, speed blur)   no_bloom   no glow
+ *   mip_in_order   a texture's levels given one by one (not level 0, the last, then the rest)
+ *   tex_ab / tex_check   (tests) the two orders timed apart; each texture's levels checked against the file
+ *   tex_redo_test   (test) every 5th compressed texture given to the GPU again, as when vitaGL's copy came out wrong
+ *   no_post   draw straight to the screen (no bloom, speed blur)   no_bloom   no glow
  *   no_sound   don't start the sound engine */
 #include <vitasdk.h>
 #include <vitaGL.h>
@@ -35,6 +38,7 @@
 #include "save.h"
 #include "front.h"
 #include "particles.h"
+#include "gputime.h"
 #include "controls.h"
 #include "camera.h"
 #include "ghost.h"
@@ -57,7 +61,21 @@ int _newlib_heap_size_user = 192 * 1024 * 1024;
 static int g_log;                              /* the log is open (written by io.c's thread) */
 static uint64_t t0;
 static uint64_t now_us(void) { return sceKernelGetProcessTimeWide(); }
+#ifdef NR_PC   /* (the test machine's game clock runs on frames: the logic's own time from the real clock) */
+#include <time.h>
+static uint64_t prof_us(void) { struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return ts.tv_sec * 1000000ull + ts.tv_nsec / 1000; }
+#else
+#define prof_us now_us
+#endif
+#ifdef NR_PC
+uint64_t phys_mark_us;
+#endif
 static float phys_us;                          /* car physics time in the current stats window */
+/* CarLogic's ramps (0x706ae4, 0x703b7a): wing_amt (+0x1d4) goes to 1 at 3 a second while the wings are out, back at 3;
+ * jet_thr (+0x120) to 1 at 2 a second while boosting (or the wings are out), back at 2 */
+static float wing_amt, jet_thr;
+static nr_pemit_state exh_st;                 /* the car's own ParticleEmitter (Objects/Car.xml): the exhaust's fire */
+static uint32_t win_dyn;                        /* the most moving objects' triangles near the car in a frame, this window */
 /* where the game thread's frame goes (race screens, microseconds): game logic, building the 3D
  * frame, the HUD, and waiting in vglSwapBuffers for the GPU and the display */
 static uint64_t T_logic, T_draw, T_hud, T_swap, T_all_busy, T_all_swap; static int T_n;
@@ -66,7 +84,12 @@ static void logm(const char *fmt, ...)
 {
     if (!g_log) return;
     char b[1400];
+#ifdef NR_PC
+    extern uint64_t nrpc_clock_peek(void);
+    int n = snprintf(b, sizeof b, "[%7.2f] ", (nrpc_clock_peek() - t0) / 1e6);
+#else
     int n = snprintf(b, sizeof b, "[%7.2f] ", (now_us() - t0) / 1e6);
+#endif
     va_list ap; va_start(ap, fmt);
     int m = vsnprintf(b + n, sizeof b - n - 1, fmt, ap);
     va_end(ap);
@@ -79,7 +102,7 @@ static void snd_log_line(const char *s) { logm("    %s", s); }
 static const uint32_t BTN_MASK[BTN_N] = { SCE_CTRL_CROSS, SCE_CTRL_CIRCLE, SCE_CTRL_SQUARE, SCE_CTRL_TRIANGLE, SCE_CTRL_LTRIGGER,
     SCE_CTRL_RTRIGGER, SCE_CTRL_UP, SCE_CTRL_DOWN, SCE_CTRL_LEFT, SCE_CTRL_RIGHT, SCE_CTRL_START, SCE_CTRL_SELECT };
 #ifdef NR_PC
-int nrpc_warp = -1, nrpc_wreck, nrpc_aim = -1; float nrpc_aim_speed = 60, nrpc_aim_sign = 1;
+int nrpc_warp = -1, nrpc_wreck, nrpc_flip, nrpc_aim = -1; float nrpc_aim_speed = 60, nrpc_aim_sign = 1;
 #endif
 static int has_switch(const char *n)
 {
@@ -87,12 +110,28 @@ static int has_switch(const char *n)
     snprintf(p, sizeof p, DATA "%s", n);
     return sceIoGetstat(p, &st) >= 0;
 }
+static int switch_num(const char *n, int def)     /* (a switch file's number: def without the file or a number in it) */
+{
+    char p[256]; snprintf(p, sizeof p, DATA "%s", n);
+    FILE *f = fopen(p, "r"); int v = def;
+    if (f) { if (fscanf(f, "%d", &v) != 1) v = def; fclose(f); }
+    return v;
+}
 
 /* ------------------------------------------------------------------ data */
 static nr_pak pak;
 static save_t SAVE;
 static void dyn_res_reset(void);
+static int sys_menu;                                  /* the system's UI over the game (logged only: main loop) */
 static void dyn_res_step(float dt, int on);
+static void frame_swap(void);
+/* (the log: the GPU's times since the last "fps" line, and over the level: lvperf; the 3D scene's size over the level) */
+static float gpu_sum, gpu_max, gpu_lv_sum, gpu_lv_max, dyn_lv_min = 1; static int gpu_n, gpu_lv_n, dyn_lv_small, dyn_lv_frames;
+static float gpu_fin_sum, gpu_lv_fin_sum, gpu_lv_fin_min;   /* (the final pass's own time: its work, and under the cap its wait - gputime.c) */
+static int gpu_lv_bin[6];                            /* (the level's frames by GPU time: under 13 ms, 13-14, 14-15, 15-16, 16-17, over) */
+#define BENCH_SETTLE_F 15                             /* (the bench: frames each way is drawn before its timing starts) */
+static int bench_mode, bench_frames;
+static float bench_gpu_sum, bench_gpu_max, bench_gpu_fin, bench_gpu_3d; static int bench_gpu_n, bench_gpu_n3;   /* (the bench: the GPU's own times for the way being timed) */
 static uint32_t act_mask(int a) { int b = SAVE.bind[a]; return b >= 0 && b < BTN_N ? BTN_MASK[b] : 0; }
 static level_rt L, MENU, CAR, FLAME, PORTALM;   /* PORTALM: the tunnels' Portal (models/portal.nrl) */
 static int menu_loaded;
@@ -124,18 +163,38 @@ static nr_objs OBJS; static int objs_on;
 #define MAX_DRAWOBJ 480
 #define MAX_OMODEL 400
 static level_rt OMODEL[MAX_OMODEL]; static char OMNAME[MAX_OMODEL][48]; static int NOMODEL;
+/* the object models stay loaded for the next level that uses them, but the levels' own (and their textures) filled
+ * the Vita's video memory over a run: om_gen marks the level that last used each, and while video memory is short a
+ * model none of the current level's objects uses lets go (its slot to be used again) */
+static int om_gen[MAX_OMODEL], om_gen_cur = 1;
+static void om_trim(void)
+{
+#ifdef NR_PC
+    if (!getenv("TEXTRIM")) return;
+#else
+    if (vglMemFree(VGL_MEM_VRAM) >= (40u << 20)) return;
+#endif
+    int n = 0;
+    for (int i = 0; i < NOMODEL; i++) if (OMNAME[i][0] && om_gen[i] < om_gen_cur) { gfx_free_level(&OMODEL[i]); OMNAME[i][0] = 0; n++; }
+    if (n) logm("  object models no longer used: %d let go", n);
+}
 enum { OBJ_OSND0 = 64, OBJ_NOSND = 48, OBJ_FX0 = 112, OBJ_NFX = 16 };
 static int osnd_used[OBJ_NOSND], fx_next;
 static int om_model(void *u, const char *name, float mn[3], float mx[3])
 {
     (void)u;
-    for (int i = 0; i < NOMODEL; i++) if (!strcmp(OMNAME[i], name)) { memcpy(mn, OMODEL[i].bmin, 12); memcpy(mx, OMODEL[i].bmax, 12); return i; }
-    if (NOMODEL >= MAX_OMODEL) return -1;
+    for (int i = 0; i < NOMODEL; i++) if (OMNAME[i][0] && !strcmp(OMNAME[i], name)) { om_gen[i] = om_gen_cur; memcpy(mn, OMODEL[i].bmin, 12); memcpy(mx, OMODEL[i].bmax, 12); return i; }
+    om_trim();
+    int s = 0;
+    while (s < NOMODEL && OMNAME[s][0]) s++;                /* (a slot let go, or a new one) */
+    if (s >= MAX_OMODEL) return -1;
     char p[80]; snprintf(p, sizeof p, "models/%s.nrl", name);
-    if (!gfx_load_nrl(&OMODEL[NOMODEL], &pak, p, name)) return -1;
-    snprintf(OMNAME[NOMODEL], sizeof OMNAME[0], "%s", name);
-    memcpy(mn, OMODEL[NOMODEL].bmin, 12); memcpy(mx, OMODEL[NOMODEL].bmax, 12);
-    return NOMODEL++;
+    gfx_nrl_lod = 1; int ok_ = gfx_load_nrl(&OMODEL[s], &pak, p, name); gfx_nrl_lod = 0;   /* (with simpler shapes) */
+    if (!ok_) return -1;
+    snprintf(OMNAME[s], sizeof OMNAME[0], "%s", name); om_gen[s] = om_gen_cur;
+    memcpy(mn, OMODEL[s].bmin, 12); memcpy(mx, OMODEL[s].bmax, 12);
+    if (s == NOMODEL) NOMODEL++;
+    return s;
 }
 static uint8_t *om_read(void *u, const char *p, uint32_t *sz) { (void)u; return (uint8_t *)nr_pak_read(&pak, p, sz); }
 static int objs_quiet;                             /* (the objects' head start before the countdown: no sounds) */
@@ -235,7 +294,12 @@ static void run_emitters(v3 eye, v3 fwd, float dt)
     }
 }
 static void trk_draw(int pass);
-static void draw_particles_hook(v3 eye, v3 fwd, v3 up) { trk_draw(1); if (particles_ok) particles_draw(eye, fwd, up); }
+static int sw_no_particles, bench_no_particles; /* (switch file "no_particles", and the bench: what they cost the GPU) */
+/* (the particles' GPU hitches, to find what in their drawing costs the Vita's GPU 100-300 ms a frame when there are
+ * some 2000 of the car's trails - nothing on the PC: the switch files "particles_skip" (rings made but not drawn, a
+ * bit each), "part_dbg" (gfx_part_dbg's ways) and "autoplay_secs" (each autoplay_level level this long, not 50 s) */
+static int sw_part_skip, sw_auto_secs, sw_part_dbg;
+static void draw_particles_hook(v3 eye, v3 fwd, v3 up) { trk_draw(1); if (particles_ok && !sw_no_particles && !bench_no_particles) particles_draw(eye, fwd, up); }
 static void draw_decal_hook(v3 eye, v3 fwd, v3 up) { (void)eye; (void)fwd; (void)up; trk_draw(0); }
 
 /* ------------------------------------------------------------------ the announcer */
@@ -423,34 +487,63 @@ static void loading_end(void)
 
 static int load_race_level(const char *xml)
 {
+    gfx_ring_watch("before a level was loaded");
     if (objs_on) { obj_sounds_off(); nr_objs_free(&OBJS); objs_on = 0; }
+    gfx_ring_watch("after the moving objects were freed");
     gfx_free_level(&L);
+    gfx_ring_watch("after the level's drawing was freed");
     nr_coll_free(&COLL);
+    gfx_ring_watch("after the level's collision was freed");
+    om_gen_cur++;                                          /* (the object models this level uses: om_model marks them) */
     char p[96]; snprintf(p, sizeof p, "levels/%s.nrl", xml);
     uint64_t t = now_us();
+    const uint64_t pr0 = nr_pak_read_us, pu0 = nr_pak_unpack_us, pb0 = nr_pak_bytes_read, pub0 = nr_pak_bytes_unpacked, tx0 = gfx_tex_us;
+    const int txn0 = gfx_tex_n, ab0n = gfx_tex_ab_n[0], ab1n = gfx_tex_ab_n[1];
+    const uint64_t ab0 = gfx_tex_ab_us[0], ab1 = gfx_tex_ab_us[1];
     logm("loading level %s", xml);
     int ok = gfx_load_nrl(&L, &pak, p, xml);
+    gfx_ring_watch("after the level's drawing was loaded");
     if (gfx_load_tick) gfx_load_tick();
     snprintf(p, sizeof p, "levels/%s.nrc", xml);
     uint32_t sz; uint8_t *cb = nr_pak_read(&pak, p, &sz);
+    const uint64_t cp0 = prof_us();
     if (!cb || nr_coll_parse(cb, sz, &COLL)) logm("  no collision for this level");
+    else if (COLL.sub) logm("  collision: %u triangles, %u dense cells by part (%u entries, %.1f MB), made in %.0f ms", COLL.ntri, COLL.nsubcell, COLL.nsubidx,
+                            (COLL.nsubidx * 2.0f + COLL.nsubcell * 4.0f * 18 + COLL.nx * COLL.ny * 16.0f) / 1048576.0f, (prof_us() - cp0) / 1000.0);
     free(cb);
+    gfx_ring_watch("after the level's collision was loaded");
     read_nrg(xml);
     gfx_set_lights(&L, LIGHTS, NLIGHTS);
+    gfx_ring_watch("after the level's lights were set");
     {   /* the level's objects that move and react */
         snprintf(p, sizeof p, "levels/%s.nrg", xml);
         char *gt = nr_pak_read(&pak, p, &sz);
         nr_objs_host H = { NULL, om_model, om_read, om_sound, om_rtpc, om_event };
         if (gt) { nr_objs_load(&OBJS, gt, &COLL, &H); objs_on = 1; free(gt); }
-        logm("  %d level objects, %d object models", OBJS.n, NOMODEL);
+        gfx_ring_watch("after the moving objects were loaded");
+        logm("  %d level objects, %d object models (simpler shapes for parts of %ld triangles: %ld and %ld, made in %.1f ms)", OBJS.n, NOMODEL, gfx_lod_tris[0], gfx_lod_tris[1], gfx_lod_tris[2], gfx_lod_us / 1000.0);
 #ifdef NR_PC
         haz_list();
 #endif
         load_emitters();
     }
+    gfx_ring_watch("after the emitters were made");
     gfx_prewarm();
+    gfx_ring_watch("after the programs were warmed up");
     logm("  \"%s\": %d checkpoints, %d finish points, %d sound emitters, %d boost rings, %d coolers, %d lights, loaded in %.2f s",
          G.name, G.ncp, G.nfinish, G.nsnd, G.nring, G.ncool, NLIGHTS, (now_us() - t) / 1e6);
+    logm("  of which the data: read %.2f s (%.1f MB), unpacked %.2f s (%.1f MB); %d textures given to the GPU in %.2f s", (nr_pak_read_us - pr0) / 1e6,
+         (nr_pak_bytes_read - pb0) / 1048576.0, (nr_pak_unpack_us - pu0) / 1e6, (nr_pak_bytes_unpacked - pub0) / 1048576.0, gfx_tex_n - txn0, (gfx_tex_us - tx0) / 1e6);
+    if (GSW.tex_ab) logm("  textures of several levels: given one by one %d in %.3f s, the last level second %d in %.3f s", gfx_tex_ab_n[0] - ab0n,
+                         (gfx_tex_ab_us[0] - ab0) / 1e6, gfx_tex_ab_n[1] - ab1n, (gfx_tex_ab_us[1] - ab1) / 1e6);
+    if (GSW.tex_check) logm("  texture check: %d textures so far, %d not as in the file", gfx_texchk_n, gfx_texchk_bad);
+    {   static int reop_logged, redone_logged;
+        if (nr_pak_reopened != reop_logged) { logm("  data packs opened again to read: %d times so far", nr_pak_reopened); reop_logged = nr_pak_reopened; }
+        if (gfx_tex_redone != redone_logged) {
+            logm("  textures given to the GPU again, vitaGL's copy having come out wrong: %d so far (%d still wrong after)", gfx_tex_redone, gfx_tex_still_bad);
+            redone_logged = gfx_tex_redone;
+        }
+    }
     return ok;
 }
 
@@ -463,6 +556,7 @@ static struct {
     int set, level; fe_level *lv; int story;
     int rs, rs_before_pause; float t, race_t, dead_t, done_time;
     nr_car car; nr_ai ai; float bad_time, phys_acc;
+    float prev_pos[3], prev_rot[3][3]; int interp;    /* the car before its last physics step, for the drawn pose (car_view) */
     float heat, heat_cool_delay; int warned, alarm, boosting, wings, jets, skid, scrape;
     float rpm, rev, air_rev;
     int cp_hit[64], cp_count, last_cp; float cp_ly[64];
@@ -613,6 +707,11 @@ static void tutorial_draw(void)
     hud_text_lines(HUD_FONT_MAIN, 480, y, sz, 1.15f, 0xFFFFFF00 | (unsigned)(fminf(1, a) * 255), HUD_CENTER, TUT.text);
 }
 
+/* the engine's loop (Play_CarEngine / Stop_CarEngine), started once: a wreck stops it, and a Challenge level's restart
+ * after one (and a restart from the pause menu while wrecked) has to start it again, or the car is silent from there on */
+static int engine_on;
+static void engine_play(void) { if (!engine_on) { snd_post("Play_CarEngine", OBJ_CAR); engine_on = 1; } }
+static void engine_stop(void) { snd_post("Stop_CarEngine", OBJ_CAR); engine_on = 0; }
 static void car_sounds_off(void)
 {
     if (R.boosting) { snd_post("Stop_Boost", OBJ_CAR); layer_event("Boost_Off"); }
@@ -639,6 +738,30 @@ static const float part_tmax[3];
 /* the chase camera (camera.c) */
 static nr_cam CAM;
 static void cam_reset(void) { cam_reset_to(&CAM, &R.car, &COLL); R.eye = CAM.pos; R.blur = 0; }
+#ifdef NR_PC
+static void pstat_out(const char *l) { fprintf(stderr, "%s\n", l); }
+static float cam_tx_log, cam_ty_log;
+#endif
+extern void particles_stat(int, const float *, float, void (*)(const char *));
+static void pstat_log(const char *l) { logm("  %s", l); }
+/* (the log: where the camera is and the particles round it - the bench's view, the slowest frames) */
+static void particles_log(void)
+{
+    float fy = 2.0f * atanf(tanf((R.fov > 1 ? R.fov : 60) * 3.14159265f / 360.0f) / sqrtf(960.0f / 544.0f));
+    float ev[3] = { CAM.pos.x, CAM.pos.y, CAM.pos.z };
+    logm("  camera at %.2f %.2f %.2f looking %.3f %.3f %.3f, fov %.1f", ev[0], ev[1], ev[2], -CAM.z.x, -CAM.z.y, -CAM.z.z, R.fov);
+    for (int pr = 0; pr < 3; pr++) particles_stat(pr, ev, 272.0f / tanf(fy * 0.5f), pstat_log);
+    for (int pr = 0; pr < 3; pr++) particles_check(pr, pstat_log);
+}
+/* the right stick (-1..1, down positive) as the free look's turn (right and up positive) */
+static void cam_stick(float rx, float ry, float *tx, float *ty)
+{
+    cam_stick_shape(rx, ry, tx, ty);
+    /* the stick up lowers the camera (the view tilts up), down raises it; Controls: Invert Camera Left / Right, and
+     * Up / Down (then up raises it, as the PC's CamTurnY did) */
+    if (SAVE.cam_inv_x) *tx = -*tx;
+    if (!SAVE.cam_inv_y) *ty = -*ty;
+}
 static void cam_switch_view(void) { cam_next_view(&CAM); }
 
 static void respawn_at(const float *pt)
@@ -655,9 +778,9 @@ static void respawn_oriented(const float *p, const float Rm[3][3])
 {
     float up[3] = { Rm[0][2], Rm[1][2], Rm[2][2] }, down[3] = { -up[0], -up[1], -up[2] }, at[3] = { p[0], p[1], p[2] };
     float dist, n[3]; uint32_t mat;
-    uint32_t saved = COLL.ndyn; COLL.ndyn = 0;
+    COLL.no_dyn++;                                   /* (the level's own ground, not a moving object's) */
     if (COLL.ntri && nr_coll_ray(&COLL, p, down, 25.0f, &dist, n, &mat)) for (int k = 0; k < 3; k++) at[k] = p[k] + down[k] * dist + up[k] * 1.0f;
-    COLL.ndyn = saved;
+    COLL.no_dyn--;
     nr_car_reset_rot(&R.car, at, Rm);
     R.ai.idx = nr_route_nearest(PATH, L.d.npath, at, 0, L.d.npath);
     R.heat = 0; R.warned = 0; nr_tricks_reset(&R.tricks);
@@ -755,6 +878,8 @@ static const char *veh_ghost_name(void)       /* the vehicle's ReplayRecorder "R
  * levels without one), so the unattended test drive looks like a real run; the computer driver takes the
  * levels with none */
 static float pilot_s;                           /* pilot_on 2: the distance along the level's route */
+static float pilot_speed = 30, pilot_over_t = -1;  /* pilot_on 2's speed; when the replay or the route ran out (race time) */
+static int g_autoplay_all;                       /* (autoplay_all: every level, each driven to its end) */
 static int credits_stress;                      /* autoplay: the credits driven by the computer with boost, hops and wings */
 #ifdef NR_PC
 /* (the PC test machine, AUDIT=1: the shipped replay's car checked against the port's collision as it drives -
@@ -848,8 +973,10 @@ static void haz_frame(void)
         }
     }
     float pen[1024]; uint8_t seen[1024]; memset(seen, 0, sizeof seen);
-    for (uint32_t t = 0; t < COLL.ndyn; t++) {
-        const nr_ctri *T = &COLL.dyn[t]; uint32_t oi = NR_TRI_OBJ(T->mat);
+    const float hlo[3] = { R.car.pos[0] - 12, R.car.pos[1] - 12, R.car.pos[2] - 12 }, hhi[3] = { R.car.pos[0] + 12, R.car.pos[1] + 12, R.car.pos[2] + 12 };
+    uint32_t nl = nr_coll_dyn_list(&COLL, hlo, hhi);
+    for (uint32_t t = 0; t < nl; t++) {
+        const nr_ctri *T = &COLL.dyn[COLL.dcand[t]]; uint32_t oi = NR_TRI_OBJ(T->mat);
         if (oi >= 1024 || (int)oi >= OBJS.n) continue;
         nr_obj *o = &OBJS.o[oi];
         if (o->kind == OK_BARREL || o->kind == OK_DEBRIS || o->dynamic) continue;
@@ -928,7 +1055,7 @@ static void audit_frame(void)
 #endif
 static void pilot_load(void)
 {
-    pilot_on = 0;
+    pilot_on = 0; pilot_speed = 30; pilot_over_t = -1;
     if (g_autoplay && R.credits && L.d.npath > 2 && !credits_stress) { pilot_on = 2; logm("  test drive: along the route"); return; }   /* (the credits: the player drives there) */
     if (!g_autoplay || !ghosts_ok || !R.lv || R.credits) return;
 #ifdef NR_PC
@@ -963,6 +1090,11 @@ static void pilot_load(void)
         chase_on = 1; logm("  test drive: steered along the level's route (real physics)"); return;
     }
     if (d && gh_pilot_load(d, sz) >= 0) pilot_on = 1;
+    else if (g_autoplay_all && L.d.npath > 2) {        /* (no replay: along the level's route, the whole way) */
+        free(d); pilot_on = 2; pilot_speed = 100;     /* (about the car's own speed on the straights) */
+        logm("  test drive: along the level's route at %.0f units a second (%.0f units)", pilot_speed, L.pathlen[L.d.npath - 1]);
+        return;
+    }
     logm("  test drive: %s", pilot_on ? "along the shipped replay" : "the computer driver");
 }
 static void ghosts_load_level(void)
@@ -974,7 +1106,10 @@ static void ghosts_load_level(void)
     if (!ghosts_ok || R.credits || R.story || !SAVE.ghosts || !R.lv || !R.lv->score) return;
     sc_table t; sc_get(SC_LOCAL, R.lv->xml, R.lv->score, &t);
     io_flush();                                     /* (the first time, the shipped replays were just copied) */
-    for (int r = 0; r < 10; r++) {
+    /* the PC shows the ghosts of all ten local scores; here the five fastest: bunched up at a start, each ghost's
+     * see-through glow layers piled in the same few pixels cost the Vita about 0.8 ms a frame (ten on Level 6: 8.5 ms) */
+    int shown = 0;
+    for (int r = 0; r < 10 && shown < GH_SHOWN; r++) {
         char p[256]; sc_ghost_path(p, sizeof p, R.lv->xml, r);
         FILE *f = fopen(p, "rb");
         if (!f) continue;
@@ -985,6 +1120,7 @@ static void ghosts_load_level(void)
         if (d && pilot_on && gh_pilot_same(d, (uint32_t)n)) { free(d); continue; }   /* (autoplay: not the pilot's twin) */
         int idx = pilot_on ? r : gh_count();            /* the name by load order, as the PC (autoplay: its rank, the pilot's twin being left out) */
         if (gh_load(d, (uint32_t)n, idx < t.n ? t.e[idx].initials : "???") < 0) logm("  ghost %s: not a ghost file", p);
+        else shown++;
     }
     char st[256]; gh_stats(st, sizeof st);
     logm("  %s", st);
@@ -1008,7 +1144,8 @@ static void pilot_route(float dt)                   /* the car glides along the 
 {
     uint32_t n = L.d.npath;
     if (R.rs != RS_RACE || n < 2) return;
-    pilot_s += 30 * dt;
+    pilot_s += pilot_speed * dt;
+    if (pilot_s >= L.pathlen[n - 1] && pilot_over_t < 0) { pilot_over_t = R.race_t; logm("  test drive: the end of the route at %.1f s", R.race_t); }
     uint32_t i = 0;
     while (i + 2 < n && L.pathlen[i + 1] < pilot_s) i++;
     float seg = L.pathlen[i + 1] - L.pathlen[i], t = seg > 1e-4f ? (pilot_s - L.pathlen[i]) / seg : 0;
@@ -1021,7 +1158,7 @@ static void pilot_route(float dt)                   /* the car glides along the 
     R.car.pos[0] = p.x; R.car.pos[1] = p.y; R.car.pos[2] = p.z;
     for (int k = 0; k < 3; k++) { R.car.rot[k][0] = (&r.x)[k]; R.car.rot[k][1] = (&f.x)[k]; R.car.rot[k][2] = (&up.x)[k]; }
     v3 v = dt > 0 ? mul(sub(p, old), 1 / dt) : v3make(0, 0, 0);
-    if (len(v) > 60) v = mul(f, 30);
+    if (len(v) > 2 * pilot_speed) v = mul(f, pilot_speed);
     R.car.vel[0] = v.x; R.car.vel[1] = v.y; R.car.vel[2] = v.z;
     memset(R.car.angvel, 0, 12); R.car.grounded = 4; R.ai.idx = i;
 }
@@ -1033,7 +1170,7 @@ static void pilot_drive(float dt)
                                                                  * the finish): the car's own physics and the computer driver
                                                                  * take it on from where it is, as it was going */
         if (R.rs == RS_RACE && pilot_on == 1) {
-            pilot_on = 0; pilot_coast = 1; R.phys_acc = 0;
+            pilot_on = 0; pilot_coast = 1; R.phys_acc = 0; R.interp = 0; pilot_over_t = R.race_t;
             {   float v[3], p[3], Rm[3][3]; memcpy(v, R.car.vel, 12); memcpy(p, R.car.pos, 12); memcpy(Rm, R.car.rot, 36);
                 nr_car_reset_rot(&R.car, p, (const float (*)[3])Rm); memcpy(R.car.vel, v, 12); }    /* (the physics' own orientation too) */
             uint32_t best = 0; float bd = 1e30f;
@@ -1067,7 +1204,7 @@ static void pilot_drive(float dt)
     if (wings != R.wings) { R.wings = wings; snd_post(wings ? "Play_WingOut" : "Play_WingIn", OBJ_CAR); layer_event(wings ? "Wings_On" : "Wings_Off"); }
     if (was_dead) {                                            /* the replay's respawn */
         R.rs = RS_RACE; R.heat = 0;
-        snd_post("Play_CarEngine", OBJ_CAR);
+        engine_play();
         snd_set_state("Crash_States", "Normal"); snd_set_state("Announcer_Crash", "Normal");
         rec_car_appears(); R.alive_t = 0;
         cam_reset(); CAM.fade = 0;
@@ -1123,24 +1260,29 @@ static void fx_log(void)
 /* (automatic tests, with the switch file "autoplay_shots": pictures of the finished frame at chosen moments, the
  * warp-in and warp-out, the first wing trail and the first sparks of each race, as TGA files in test_shots/) */
 static int test_shots; static char test_shot_req[80]; static float test_spark_t = -1;
+static void test_shot_save(const char *name, const uint8_t *px)   /* (960 x 544 RGBA, as read: a TGA, bottom row first) */
+{
+    const int w = 960, h = 544;
+    char path[160]; snprintf(path, sizeof path, DATA "test_shots/%s.tga", name);
+    FILE *f = fopen(path, "wb"); uint8_t *row = malloc((size_t)w * 3);
+    if (f && row) {
+        uint8_t hd[18] = { 0, 0, 2 }; hd[12] = w & 255; hd[13] = w >> 8; hd[14] = h & 255; hd[15] = h >> 8; hd[16] = 24;
+        fwrite(hd, 1, 18, f);
+        for (int y = 0; y < h; y++) {
+            const uint8_t *q = px + (size_t)y * w * 4;
+            for (int i = 0; i < w; i++) { row[i * 3] = q[i * 4 + 2]; row[i * 3 + 1] = q[i * 4 + 1]; row[i * 3 + 2] = q[i * 4]; }
+            fwrite(row, 3, (size_t)w, f);
+        }
+        logm("  test picture %s", name);
+    }
+    if (f) fclose(f);
+    free(row);
+}
 static void test_shot_take(void)
 {
     if (!test_shot_req[0]) return;
-    const int w = 960, h = 544;
-    uint8_t *px = malloc((size_t)w * h * 4);
-    if (px) {
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        char path[160]; snprintf(path, sizeof path, DATA "test_shots/%s.tga", test_shot_req);
-        FILE *f = fopen(path, "wb");
-        if (f) {
-            uint8_t hd[18] = { 0, 0, 2 }; hd[12] = w & 255; hd[13] = w >> 8; hd[14] = h & 255; hd[15] = h >> 8; hd[16] = 24;
-            fwrite(hd, 1, 18, f);
-            for (int i = 0; i < w * h; i++) { uint8_t t = px[i * 4]; px[i * 3] = px[i * 4 + 2]; px[i * 3 + 1] = px[i * 4 + 1]; px[i * 3 + 2] = t; }
-            fwrite(px, 3, (size_t)w * h, f); fclose(f);
-            logm("  test picture %s", test_shot_req);
-        }
-        free(px);
-    }
+    uint8_t *px = malloc((size_t)960 * 544 * 4);
+    if (px) { glReadPixels(0, 0, 960, 544, GL_RGBA, GL_UNSIGNED_BYTE, px); test_shot_save(test_shot_req, px); free(px); }
     test_shot_req[0] = 0;
 }
 #define CD_T0 (-6.0f)            /* the countdown's clock starts at -6 (0x715440) */
@@ -1150,10 +1292,16 @@ static void test_shot_take(void)
 #define CD_OBJS (CD_T0 + CD_RATE * (-CD_T0 / CD_RATE - OBJS_AT_GO))   /* the countdown's clock when they start */
 static void start_race_ex(int challenge_retry)
 {
+#ifdef NR_PC
+    uint64_t rt0 = prof_us(), rt1 = 0, rt2 = 0, rt3 = 0, rt4 = 0;
+#endif
     if (challenge_retry) frc_off();                 /* (the failed attempts stay: the results replay them all) */
     else frc_stop();
     race_quiet = challenge_retry;
     if (ghosts_dirty || (g_autoplay && !pilot_on && R.lv && !R.credits)) ghosts_load_level();
+#ifdef NR_PC
+    rt1 = prof_us();
+#endif
     gh_rewind(); gh_labels_fade(0); rec_reset_all(); pilot_had_car = 0; pilot_s = 0; pilot_coast = 0;
     R.fin_stage = 0; R.fin_rank = 99;
     car_sounds_off();
@@ -1169,21 +1317,37 @@ static void start_race_ex(int challenge_retry)
     place_at_start();
     if (chase_on) ch_restart(&CH);
     CAM.far_view = CAM.bumper = 0; CAM.lb = CAM.bb = 0;
+#ifdef NR_PC
+    if (getenv("CAMVIEW")) { int cv = atoi(getenv("CAMVIEW")); CAM.far_view = cv == 1; CAM.bumper = cv == 2; }   /* (1 Far, 2 Bumper) */
+#endif
     cam_reset(); CAM.fade = 0; CAM.fov = 60;
     R.fov = 60; R.blur = 0; R.shake_amp = 0;
-    R.rs = RS_COUNT; R.t = 0; R.race_t = 0; R.bad_time = 0; R.phys_acc = 0; R.heat = 0; R.boom_t = 0;
+    R.rs = RS_COUNT; R.t = 0; R.race_t = 0; R.bad_time = 0; R.phys_acc = 0; R.interp = 0; R.heat = 0; R.boom_t = 0;
     R.cd = CD_T0; R.cd_voice = 0;                     /* BeginCountdown (0x715440): the clock at -6 */
     warp_in_portal(); trk_clear();
     emitters_reset(); fx_sparks = fx_wing = fx_trk = fx_trk_glow = 0; test_spark_t = -1;
+    wing_amt = jet_thr = 0; exh_st.primed = 0; exh_st.acc = 0;
     R.msg_t = 0;
     nr_tricks_reset(&R.tricks); R.score = 0; R.tricks_level = 0; R.trick_t = 0;
     for (int i = 0; i < G.nsnd; i++) G.snd[i].armed = 1;
+#ifdef NR_PC
+    rt2 = prof_us();
+#endif
     if (objs_on) {
         obj_sounds_off(); nr_objs_restart(&OBJS);
+#ifdef NR_PC
+        rt3 = prof_us();
+#endif
         objs_head_start();
         load_emitters();
     }
+#ifdef NR_PC
+    rt4 = prof_us();
+    if (getenv("SLOWLOGIC")) logm("  race start: %.2f ms (ghosts loaded %.2f, the race's state %.2f, objects %.2f, emitters %.2f, %d objects)", (rt4 - rt0) / 1e3,
+                                  (rt1 - rt0) / 1e3, (rt2 - rt1) / 1e3, rt3 ? (rt3 - rt2) / 1e3 : 0, rt3 ? (rt4 - rt3) / 1e3 : 0, OBJS.n);
+#endif
     snd_post("Play_WarpIn", OBJ_CAR);                  /* BeginRace 0x715440 -> the car placed at the start (0x7062d0) */
+    engine_play();                                     /* (after a wreck: the engine again) */
     /* (the music and "3, 2, 1, Rush!" come at the clock's -3: countdown_step) */
 }
 /* the level's music waits for the countdown's -3 the first time (ChangeMusicMessage 0x17 with Play_NitronicRushStart) */
@@ -1214,6 +1378,8 @@ static const float part_tmax[3] = { 0.6f, 0.4f, 0.07f };
  * second that stay where they are made for 0.5 s) */
 typedef struct { int part; nr_pemit e; nr_pemit_state st; } cemit;
 static cemit CE[4]; static int nce;
+static int booster_part = -1;                 /* the vehicle's Booster Name part (the last of the boosters' group) */
+
 static void emitters_reset(void) { for (int i = 0; i < nce; i++) { CE[i].st.primed = 0; CE[i].st.acc = 0; } }
 static void load_parts(const char *key)
 {
@@ -1256,6 +1422,8 @@ static void load_parts(const char *key)
         }
     }
     free(t);
+    booster_part = -1;
+    for (int i = 0; i < ncp; i++) if (CP[i].group == 1) booster_part = i;   /* (pack_car_parts adds Booster Name last in its group) */
     logm("  moving parts %d (%d models), flames %d, particle emitters %d", ncp, ncpm, ncf, nce);
 }
 
@@ -1454,8 +1622,16 @@ typedef struct {
 static trk_t TRK[TRK_MAX]; static int trk_slot[4] = { -1, -1, -1, -1 };
 static float tire_slip_amount = 0.9f;
 static GLuint trk_tex, trk_rainbow;
+/* the quads, each track's at its own place (built again only when its shape or fade changes: up to 48 x 32 x 4 points
+ * a frame cost the Vita milliseconds), drawn in runs of tracks side by side */
 static uint8_t TRKV[TRK_MAX * TRK_SEG * 4 * NR_VERTEX_SIZE]; static int trk_nq, trk_dark, trk_glow;
-static void trk_clear(void) { memset(TRK, 0, sizeof TRK); for (int w = 0; w < 4; w++) trk_slot[w] = -1; trk_nq = 0; }
+static uint8_t trk_vis[TRK_MAX], trk_fade[TRK_MAX]; static int trk_built[TRK_MAX];
+static struct { int on, count; float frac, len, avg, A[3], cur[3], M1[3], M2[3], side[3], n[3]; } trk_key[TRK_MAX];
+static void trk_clear(void)
+{
+    memset(TRK, 0, sizeof TRK); for (int w = 0; w < 4; w++) trk_slot[w] = -1; trk_nq = 0;
+    memset(trk_vis, 0, sizeof trk_vis); memset(trk_built, 0, sizeof trk_built);
+}
 static void trk_end(int w)                         /* 0x6bbb90: shorter than 2: straight to the fade */
 {
     int i = trk_slot[w]; if (i < 0) return;
@@ -1526,6 +1702,7 @@ static float smooth01(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x * x * (
 static void trk_build(v3 eye)
 {
     trk_nq = 0; trk_dark = trk_glow = 0;
+    memset(trk_vis, 0, sizeof trk_vis);
     if (!trk_tex) return;
     for (int i = 0; i < TRK_MAX; i++) {
         const trk_t *t = &TRK[i];
@@ -1538,6 +1715,18 @@ static void trk_build(v3 eye)
         float ga = smooth01((W - 19.2f) * 0.625f), gb = smooth01((W - 22.4f) * 10.0f);
         if (ga < 0.999f) trk_dark = 1;
         if (ga > 0.001f && !trk_glow) { trk_glow = 1; fx_trk_glow++; }
+        trk_vis[i] = 1; trk_nq += TRK_SEG;
+        uint8_t fb = (uint8_t)(fade * 255 + 0.5f);
+        __typeof__(trk_key[0]) key; memset(&key, 0, sizeof key);
+        key.on = t->on; key.count = t->count; key.frac = t->frac; key.len = t->len; key.avg = t->avg;
+        memcpy(key.A, t->A, 12); memcpy(key.cur, t->cur, 12); memcpy(key.M1, t->M1, 12); memcpy(key.M2, t->M2, 12);
+        memcpy(key.side, t->side, 12); memcpy(key.n, t->n, 12);
+        uint8_t *v = TRKV + (size_t)i * TRK_SEG * 4 * NR_VERTEX_SIZE;
+        if (trk_built[i] && !memcmp(&key, &trk_key[i], sizeof key)) {    /* the same shape: the fade only */
+            if (trk_fade[i] != fb) { for (int q = 0; q < TRK_SEG * 4; q++) v[q * NR_VERTEX_SIZE + 25] = fb; trk_fade[i] = fb; }
+            continue;
+        }
+        trk_key[i] = key; trk_built[i] = 1; trk_fade[i] = fb;
         float C[3], E[3], H[3];
         for (int k = 0; k < 3; k++) {
             C[k] = t->M1[k] * (1 - t->frac) + t->M2[k] * t->frac - t->A[k];
@@ -1545,7 +1734,6 @@ static void trk_build(v3 eye)
             H[k] = 0.5f * E[k] - C[k];
         }
         for (int j = 0; j < TRK_SEG; j++) {
-            uint8_t *v = TRKV + (size_t)trk_nq * 4 * NR_VERTEX_SIZE;
             for (int c = 0; c < 4; c++, v += NR_VERTEX_SIZE) {
                 float sv = (float)(j + (c == 2 || c == 3)) / TRK_SEG, x = (c == 1 || c == 2) ? 0.16f : -0.16f;
                 float a = 2 * sv, b = 2 * sv * (2 * sv - 1), f[5];
@@ -1554,66 +1742,131 @@ static void trk_build(v3 eye)
                 float cap = L <= 1 ? sv : sv < 0.5f ? fminf(sv * L, 0.5f) : fmaxf(0.5f, (sv - 1) * L + 1);
                 memcpy(v, f, 20);
                 v[20] = (uint8_t)(int8_t)(ga * 127); v[21] = (uint8_t)(int8_t)(gb * 127); v[22] = v[23] = 0;
-                v[24] = (uint8_t)(cap * 255 + 0.5f); v[25] = (uint8_t)(fade * 255 + 0.5f); v[26] = v[27] = 0;
+                v[24] = (uint8_t)(cap * 255 + 0.5f); v[25] = fb; v[26] = v[27] = 0;
                 v[28] = v[29] = v[30] = v[31] = 0;
             }
-            trk_nq++;
         }
     }
 }
 static void trk_draw(int pass)
 {
     if (!trk_nq || (pass == 0 && !trk_dark) || (pass == 1 && !trk_glow)) return;
-    for (int q = 0; q < trk_nq; q += 1024)
-        gfx_tracks(TRKV + (size_t)q * 4 * NR_VERTEX_SIZE, trk_nq - q < 1024 ? trk_nq - q : 1024, trk_tex, trk_rainbow, pass);
+    for (int i = 0; i < TRK_MAX; ) {                   /* (each run of tracks drawn side by side: in the tracks' order) */
+        if (!trk_vis[i]) { i++; continue; }
+        int j = i; while (j < TRK_MAX && trk_vis[j] && (j - i + 1) * TRK_SEG <= 1024) j++;
+        gfx_tracks(TRKV + (size_t)i * TRK_SEG * 4 * NR_VERTEX_SIZE, (j - i) * TRK_SEG, trk_tex, trk_rainbow, pass);
+        i = j;
+    }
 }
 
 /* ---- the car's sparks (CarLogic::HandleCollisions 0x709290, SparkBitch): at each of the body's contacts this frame the
  * emitter is moved there, pointed along the contact's normal, and makes (int)(5 x min(sliding speed / 3, 15)) sparks at
- * once (re_F2.md 4.6). The PC's body is its convex hull; the physics here stands in for it with spheres, which don't
- * reach its flat underside, so the hull's bottom corners (the lowest vertices of CarHull.mdc, DeloreanHull.mdc and
- * VanConvex.mdc) spark too where they touch the ground (only the sparks: the physics is left as it is) */
+ * once (re_F2.md 4.6). The PC's body is its convex hull (CarHull.mdc, DeloreanHull.mdc, VanConvex.mdc, CycleBodyC.mdc),
+ * which touches a surface at several of its vertices at once (a roof slide: the roof's, a bellyflop: the floor's
+ * corners) - each a contact of its own; the physics here stands in for the hull with spheres and keeps one contact a
+ * surface. So the hull's vertices are put back: each one within 2 cm of a surface the body touches this frame is a
+ * contact, at its own sliding speed; and the floor's corners, which the spheres don't reach, are tried against the
+ * ground by a short ray (only the sparks: the physics is left as it is) */
 
-#define HULL_REACH 0.41f          /* (the hull corner's ray: from 0.4 above it to 1 cm below) */
-#define SPARKS_PER_FRAME 150      /* (the Vita: at most this many sparks a frame; the PC makes up to 75 per contact) */
-static const float HULL_CAR[8][3] = { { -0.836f, -0.872f, -0.383f }, { -0.836f, 1.376f, -0.383f }, { -0.714f, 1.645f, -0.365f },
-    { -0.434f, 1.763f, -0.365f }, { 0.434f, 1.763f, -0.365f }, { 0.714f, 1.645f, -0.365f }, { 0.836f, -0.872f, -0.383f },
-    { 0.836f, 1.376f, -0.383f } };
-static const float HULL_DELOREAN[9][3] = { { -0.865f, 1.192f, -0.422f }, { -0.833f, -0.367f, -0.432f }, { -0.803f, -1.46f, -0.415f },
-    { -0.699f, 1.814f, -0.393f }, { 0, 1.867f, -0.393f }, { 0.699f, 1.814f, -0.393f }, { 0.803f, -1.46f, -0.415f },
-    { 0.833f, -0.367f, -0.432f }, { 0.865f, 1.192f, -0.422f } };
-static const float HULL_VAN[7][3] = { { -0.999f, -1.993f, -0.736f }, { -0.999f, 2.313f, -0.736f }, { -0.787f, 2.571f, -0.736f },
-    { 0, 2.651f, -0.736f }, { 0.787f, 2.571f, -0.736f }, { 0.999f, -1.993f, -0.736f }, { 0.999f, 2.313f, -0.736f } };
+#define HULL_REACH 0.41f          /* (the floor corner's ray: from 0.4 above it to 1 cm below) */
+#define HULL_TOUCH 0.02f          /* (a vertex this near a touched surface touches it) */
+static const float HULL_CAR[29][3] = {
+    { -0.836f, -0.872f, -0.383f }, { 0.836f, -0.872f, -0.383f }, { -0.836f, 1.376f, -0.383f }, { 0.836f, 1.376f, -0.383f },
+    { -0.714f, 1.645f, -0.365f }, { 0.714f, 1.645f, -0.365f }, { -0.434f, 1.763f, -0.365f }, { 0.434f, 1.763f, -0.365f },
+    { 0, -1.772f, -0.174f }, { -0.825f, -1.607f, -0.164f }, { 0.825f, -1.607f, -0.164f }, { -0.714f, 1.652f, -0.086f },
+    { 0.714f, 1.652f, -0.086f }, { -0.434f, 1.770f, -0.086f }, { 0.434f, 1.770f, -0.086f }, { -0.778f, 1.231f, 0.088f },
+    { 0.778f, 1.231f, 0.088f }, { 0, 1.392f, 0.139f }, { -0.799f, -0.577f, 0.190f }, { 0.799f, -0.577f, 0.190f },
+    { -0.716f, -1.633f, 0.284f }, { 0.716f, -1.633f, 0.284f }, { 0, -1.783f, 0.368f }, { -0.416f, 0.261f, 0.442f },
+    { 0.416f, 0.261f, 0.442f }, { 0, 0.372f, 0.442f }, { -0.372f, -0.498f, 0.453f }, { 0.372f, -0.498f, 0.453f },
+    { 0, -0.605f, 0.483f } };
+static const float HULL_DELOREAN[41][3] = {
+    { -0.833f, -0.367f, -0.432f }, { 0.833f, -0.367f, -0.432f }, { -0.865f, 1.192f, -0.422f }, { 0.865f, 1.192f, -0.422f },
+    { -0.803f, -1.460f, -0.415f }, { 0.803f, -1.460f, -0.415f }, { -0.699f, 1.814f, -0.393f }, { 0.699f, 1.814f, -0.393f },
+    { 0, 1.867f, -0.393f }, { 0, -1.847f, -0.332f }, { 0.733f, -1.827f, -0.312f }, { -0.733f, -1.813f, -0.312f },
+    { 0, -1.936f, -0.149f }, { -0.761f, -1.916f, -0.149f }, { 0.738f, -1.900f, -0.149f }, { -0.909f, -1.072f, -0.119f },
+    { 0.909f, -1.072f, -0.119f }, { -0.909f, 1.183f, -0.119f }, { 0.909f, 1.183f, -0.119f }, { -0.757f, 1.996f, -0.119f },
+    { 0.757f, 1.996f, -0.119f }, { 0, 2.042f, -0.117f }, { -0.698f, 1.870f, 0.015f }, { 0.698f, 1.870f, 0.015f },
+    { 0, 1.904f, 0.030f }, { -0.456f, -1.971f, 0.140f }, { 0.456f, -1.971f, 0.140f }, { -0.614f, -1.881f, 0.183f },
+    { 0.614f, -1.881f, 0.183f }, { -0.775f, -0.620f, 0.183f }, { 0.775f, -0.620f, 0.183f }, { -0.836f, 0.426f, 0.183f },
+    { 0.836f, 0.426f, 0.183f }, { -0.518f, 0.023f, 0.437f }, { 0.518f, 0.023f, 0.437f }, { 0, 0.028f, 0.468f },
+    { -0.434f, -1.860f, 0.474f }, { 0.434f, -1.860f, 0.474f }, { -0.531f, -0.668f, 0.476f }, { 0.531f, -0.668f, 0.476f },
+    { 0, -0.689f, 0.502f } };
+static const float HULL_VAN[38][3] = {
+    { -0.999f, -1.993f, -0.736f }, { 0.999f, -1.993f, -0.736f }, { -0.999f, 2.313f, -0.736f }, { 0.999f, 2.313f, -0.736f },
+    { -0.787f, 2.571f, -0.736f }, { 0.787f, 2.571f, -0.736f }, { 0, 2.651f, -0.736f }, { -0.762f, -2.522f, -0.622f },
+    { 0.762f, -2.522f, -0.622f }, { -0.990f, -2.427f, -0.561f }, { 0.990f, -2.427f, -0.561f }, { 0, 2.629f, -0.384f },
+    { -0.787f, 2.549f, -0.374f }, { 0.787f, 2.549f, -0.374f }, { -0.999f, 2.291f, -0.373f }, { 0.999f, 2.291f, -0.373f },
+    { -0.969f, 2.073f, 0.057f }, { 0.969f, 2.073f, 0.057f }, { -0.747f, 2.334f, 0.057f }, { 0.747f, 2.334f, 0.057f },
+    { 0, 2.410f, 0.057f }, { -0.969f, 0, 0.091f }, { 0.969f, 0, 0.091f }, { -0.754f, -2.485f, 0.177f },
+    { 0.754f, -2.485f, 0.177f }, { -0.960f, -2.389f, 0.177f }, { 0.960f, -2.389f, 0.177f }, { -0.677f, -2.393f, 0.744f },
+    { 0.677f, -2.393f, 0.744f }, { -0.801f, -2.270f, 0.802f }, { 0.801f, -2.270f, 0.802f }, { -0.801f, 1.058f, 0.811f },
+    { 0.801f, 1.058f, 0.811f }, { -0.539f, -2.225f, 0.887f }, { 0.539f, -2.225f, 0.887f }, { -0.527f, 1.317f, 0.899f },
+    { 0.527f, 1.317f, 0.899f }, { 0, 1.395f, 0.915f } };
+static const float HULL_CYCLE[32][3] = {
+    { -0.148f, 0.331f, -0.196f }, { 0.148f, 0.331f, -0.196f }, { -0.100f, 0.838f, -0.163f }, { 0.100f, 0.838f, -0.163f },
+    { -0.125f, -0.248f, -0.162f }, { 0.125f, -0.248f, -0.162f }, { -0.215f, -0.220f, -0.103f }, { 0.215f, -0.220f, -0.103f },
+    { -0.261f, 0.117f, -0.089f }, { 0.261f, 0.117f, -0.089f }, { -0.114f, -0.867f, -0.082f }, { 0.114f, -0.867f, -0.082f },
+    { 0, 1.025f, 0.244f }, { -0.146f, 0.998f, 0.255f }, { 0.146f, 0.998f, 0.255f }, { -0.192f, 0.892f, 0.281f },
+    { 0.192f, 0.892f, 0.281f }, { -0.106f, -0.992f, 0.301f }, { 0.106f, -0.992f, 0.301f }, { -0.164f, -0.852f, 0.303f },
+    { 0.164f, -0.852f, 0.303f }, { -0.106f, -0.989f, 0.374f }, { 0.106f, -0.989f, 0.374f }, { -0.146f, 1.007f, 0.401f },
+    { 0.146f, 1.007f, 0.401f }, { 0, 1.028f, 0.401f }, { -0.099f, -0.841f, 0.445f }, { 0.099f, -0.841f, 0.445f },
+    { -0.282f, 0.445f, 0.522f }, { 0.282f, 0.445f, 0.522f }, { -0.157f, 0.640f, 0.629f }, { 0.157f, 0.640f, 0.629f } };
 static void car_sparks(void)
 {
     if (!particles_ok) return;
-    int budget = SPARKS_PER_FRAME;
-    for (int k = 0; k < R.car.ncontact && k < 16; k++)
-        particles_spark_emit(R.car.contact[k].p, R.car.contact[k].n, fminf(R.car.contact[k].slide / 3.0f, 15.0f), &budget);
-    /* (not while the test drive follows a replay: its poses, interpolated between the recording's ticks, cut through
-     * the road's crests, so the hull's corners would be in the road there all the time) */
-    if (!COLL.ntri || R.car.grounded == 0 || pilot_on) return;
+    int budget = particles_spark_budget();
     const char *key = SAVE.vehicle >= 0 && SAVE.vehicle < FE_NVEH ? FE_VEH[SAVE.vehicle].key : "";
-    const float (*hp)[3] = HULL_CAR; int nh = 8;
-    if (!strcmp(key, "commander")) { hp = HULL_DELOREAN; nh = 9; }
-    else if (!strcmp(key, "avenger")) { hp = HULL_VAN; nh = 7; }
-    float up[3] = { R.car.rot[0][2], R.car.rot[1][2], R.car.rot[2][2] }, com[3];
+    const float (*hp)[3] = HULL_CAR; int nh = 29, nfloor = 8;    /* (the floor corners: the first ones, the lowest) */
+    if (!strcmp(key, "commander")) { hp = HULL_DELOREAN; nh = 41; nfloor = 9; }
+    else if (!strcmp(key, "avenger")) { hp = HULL_VAN; nh = 38; nfloor = 7; }
+    else if (strstr(key, "cycle")) { hp = HULL_CYCLE; nh = 32; nfloor = 2; }
+    float com[3];
     for (int k = 0; k < 3; k++) com[k] = R.car.pos[k] + R.car.rot[k][0] * carp.com[0] + R.car.rot[k][1] * carp.com[1] + R.car.rot[k][2] * carp.com[2];
+    float W[41][3];
+    for (int i = 0; i < nh; i++) for (int k = 0; k < 3; k++)
+        W[i][k] = R.car.pos[k] + R.car.rot[k][0] * hp[i][0] + R.car.rot[k][1] * hp[i][1] + R.car.rot[k][2] * hp[i][2];
+    /* each vertex's surface: the deepest of the body's contacts it is at (cp, n, the surface's material) */
+    signed char on[41]; float at[41][3], nn[41][3]; uint32_t mt[41]; float dep[41];
+    memset(on, 0, sizeof on);
+    int nc = R.car.ncontact < 16 ? R.car.ncontact : 16, used[16] = { 0 };
+    for (int k = 0; k < nc; k++) {
+        const float *cp = R.car.contact[k].p, *n = R.car.contact[k].n;
+        for (int i = 0; i < nh; i++) {
+            float d = (W[i][0] - cp[0]) * n[0] + (W[i][1] - cp[1]) * n[1] + (W[i][2] - cp[2]) * n[2];
+            if (d > HULL_TOUCH || (on[i] && d >= dep[i])) continue;
+            on[i] = 1; dep[i] = d; mt[i] = R.car.contact[k].mat; used[k] = 1;
+            for (int j = 0; j < 3; j++) { at[i][j] = W[i][j] - n[j] * d; nn[i][j] = n[j]; }
+        }
+    }
+    /* the floor's corners against the ground (not while the test drive follows a replay: its poses, interpolated
+     * between the recording's ticks, cut through the road's crests, so the corners would be in the road there all the time) */
+    if (COLL.ntri && R.car.grounded && !pilot_on) {
+        float up[3] = { R.car.rot[0][2], R.car.rot[1][2], R.car.rot[2][2] }, d[3] = { -up[0], -up[1], -up[2] };
+        for (int i = 0; i < nfloor && i < nh; i++) {
+            if (on[i]) continue;
+            float o[3], t, n[3]; uint32_t m = 0;
+            for (int k = 0; k < 3; k++) o[k] = W[i][k] + up[k] * 0.4f;
+            if (!nr_coll_ray(&COLL, o, d, HULL_REACH, &t, n, &m)) continue;      /* (the corner at the ground, or in it) */
+            on[i] = 1; mt[i] = m;
+            for (int k = 0; k < 3; k++) { at[i][k] = o[k] + d[k] * t; nn[i][k] = n[k]; }
+        }
+    }
     for (int i = 0; i < nh && budget > 0; i++) {
-        const float *l = hp[i];
-        float P[3], o[3], d[3] = { -up[0], -up[1], -up[2] }, t, n[3];
-        for (int k = 0; k < 3; k++) P[k] = R.car.pos[k] + R.car.rot[k][0] * l[0] + R.car.rot[k][1] * l[1] + R.car.rot[k][2] * l[2];
-        for (int k = 0; k < 3; k++) o[k] = P[k] + up[k] * 0.4f;
-        if (!nr_coll_ray(&COLL, o, d, HULL_REACH, &t, n, NULL)) continue;      /* (the corner at the ground, or in it) */
-        float r[3] = { P[0] - com[0], P[1] - com[1], P[2] - com[2] }, v[3];
+        if (!on[i]) continue;
+        float r[3] = { W[i][0] - com[0], W[i][1] - com[1], W[i][2] - com[2] }, v[3], sv[3];
         v[0] = R.car.vel[0] + R.car.angvel[1] * r[2] - R.car.angvel[2] * r[1];
         v[1] = R.car.vel[1] + R.car.angvel[2] * r[0] - R.car.angvel[0] * r[2];
         v[2] = R.car.vel[2] + R.car.angvel[0] * r[1] - R.car.angvel[1] * r[0];
+        nr_coll_point_vel(&COLL, mt[i], at[i], sv);                   /* (a moving object's own motion) */
+        for (int k = 0; k < 3; k++) v[k] -= sv[k];
+        const float *n = nn[i];
         float vn = v[0] * n[0] + v[1] * n[1] + v[2] * n[2], vt[3] = { v[0] - vn * n[0], v[1] - vn * n[1], v[2] - vn * n[2] };
         float slide = sqrtf(vt[0] * vt[0] + vt[1] * vt[1] + vt[2] * vt[2]);
-        float at[3] = { o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t };
-        particles_spark_emit(at, n, fminf(slide / 3.0f, 15.0f), &budget);
+        particles_spark_emit(at[i], n, fminf(slide / 3.0f, 15.0f), &budget);
     }
+    /* a contact no vertex is at (an edge, a corner of the level): sparks where it is, as before */
+    for (int k = 0; k < nc && budget > 0; k++)
+        if (!used[k]) particles_spark_emit(R.car.contact[k].p, R.car.contact[k].n, fminf(R.car.contact[k].slide / 3.0f, 15.0f), &budget);
 }
 
 /* the vehicle picked on the level screen: its model and handling */
@@ -1656,8 +1909,88 @@ static void load_vehicle(int i)
 }
 
 static fe_level CREDITS_LEVEL = { "credits_level", "Credits", 4, 1, 9, 1, 0, "", 1 };
+/* (autoplay: each level's frames, for its PERF line and the summary at the end. A frame that missed the display's
+ * 60 Hz takes two refreshes, 33 ms: "dropped" counts the frames over 25 ms; over 17.2 ms with the cap off) */
+typedef struct { char name[40]; int frames, dropped, over, late; float worst, worst_at, cpu_worst, peak, gpu_avg, gpu_max, dyn_min, dyn_small; } lv_perf;
+static lv_perf LVP, LVP_ALL[72]; static int lvp_n, lvp_on;
+static float fr_logic, fr_draw, fr_swap;          /* this race frame: game logic, drawing (with the HUD), the swap's wait (ms) */
+/* (the stretches of a level whose frames went over 16.7 ms: where they are, so they can be looked at) */
+static struct { int on, n, lines; float t0, t1, worst, logic, draw, swap, quiet; } OVR;
+static void over_flush(void)
+{
+    if (OVR.on && OVR.lines < 40) {
+        logm("  OVER %s %.1f-%.1f s: %d frames over budget, worst %.1f ms (its logic %.1f, drawing %.1f, swap %.1f)",
+             LVP.name, OVR.t0, OVR.t1, OVR.n, OVR.worst, OVR.logic, OVR.draw, OVR.swap);
+        OVR.lines++;
+    }
+    OVR.on = 0;
+}
+static char snd_flicker[24];                         /* (the switch file snd_flicker: see the scrape's sound) */
+static int lvp_snd_dumped;                           /* (the voices listed once a level, at a crowd: see the 5 s lines) */
+static void lvperf_begin(const char *name)
+{
+    memset(&LVP, 0, sizeof LVP); snprintf(LVP.name, sizeof LVP.name, "%s", name); lvp_on = 1;
+    snd_ev_report(NULL, "", 0, 0); snd_ev_report(NULL, "", 0, 1); lvp_snd_dumped = 0;
+    memset(&OVR, 0, sizeof OVR);
+    snd_peak_lv(NULL, NULL);
+    snd_limiter_lv(NULL, NULL);
+    gpu_lv_sum = gpu_lv_max = 0; gpu_lv_n = 0; dyn_lv_min = 1; dyn_lv_small = dyn_lv_frames = 0; memset(gpu_lv_bin, 0, sizeof gpu_lv_bin);
+    gpu_lv_fin_sum = 0; gpu_lv_fin_min = 99;
+    logm("  dynamic resolution: %s; the GPU's clock: %s", SAVE.dyn_res ? "on (Options)" : "off (Options)", gt_working() ? "running" : "no times lately");
+}
+static void lvperf_frame(float ms, float cpu, int vsync)
+{
+    if (!lvp_on) return;
+    LVP.frames++;
+    if (ms > 25.0f) LVP.dropped++;
+    if (ms > (vsync ? 17.2f : 16.7f)) LVP.over++;
+    if (ms > LVP.worst) { LVP.worst = ms; LVP.worst_at = R.race_t; }
+    if (cpu > LVP.cpu_worst) LVP.cpu_worst = cpu;
+    /* (ms is the frame before's time, from this frame's start: its parts are the ones kept from then) */
+    static float pl, pd, ps;
+    if (ms > (vsync ? 25.0f : 16.9f)) {           /* (the cap on: a missed refresh; off: a frame that would miss one) */
+        if (!OVR.on) { OVR.on = 1; OVR.n = 0; OVR.t0 = R.race_t; OVR.worst = 0; }
+        OVR.n++; OVR.t1 = R.race_t; OVR.quiet = 0;
+        if (ms > OVR.worst) { OVR.worst = ms; OVR.logic = pl; OVR.draw = pd; OVR.swap = ps; }
+    } else if (OVR.on && (OVR.quiet += ms) > 500) over_flush();
+    pl = fr_logic; pd = fr_draw; ps = fr_swap;
+}
+static void lvperf_end(void)
+{
+    if (!lvp_on) return;
+    over_flush();
+    lvp_on = 0;
+    float pk; int lt; snd_peak_lv(&pk, &lt); LVP.peak = pk; LVP.late = lt;
+    snd_ev_report(snd_log_line, "in the level", 12, 0);
+    LVP.gpu_avg = gpu_lv_n ? gpu_lv_sum / gpu_lv_n : 0; LVP.gpu_max = gpu_lv_max;
+    LVP.dyn_min = dyn_lv_min; LVP.dyn_small = dyn_lv_frames ? 100.0f * dyn_lv_small / dyn_lv_frames : 0;
+    logm("PERF %s: %d frames, dropped %d (%.2f%%), over 16.7 ms %d, worst %.1f ms at %.1f s, game thread worst %.1f ms | GPU %.1f ms a frame, worst %.1f | 3D scene under full size %.0f%% of the time, smallest %.0f%% | sound late %d, mixer peak %.0f%%",
+         LVP.name, LVP.frames, LVP.dropped, LVP.frames ? 100.0f * LVP.dropped / LVP.frames : 0, LVP.over, LVP.worst, LVP.worst_at, LVP.cpu_worst,
+         LVP.gpu_avg, LVP.gpu_max, LVP.dyn_small, LVP.dyn_min * 100, LVP.late, LVP.peak * 100);
+    { float ldb, lms; snd_limiter_lv(&ldb, &lms);
+      if (lms > 0) logm("  sound limiter (peaks past -1 dB full scale): down to %.1f dB at most, %.0f ms in all", ldb, lms); }
+    if (gpu_lv_n) logm("  GPU: the final pass counted as %.1f ms a frame; from the glow passes' end to its own %.2f ms (least %.2f: its work, and with the cap on its wait for the screen)",
+                       gt_final_ms, gpu_lv_fin_sum / gpu_lv_n, gpu_lv_fin_min);
+    if (gpu_lv_n) logm("  GPU times: under 13 ms %d frames, 13-14 %d, 14-15 %d, 15-16 %d, 16-17 %d, over 17 %d",
+                       gpu_lv_bin[0], gpu_lv_bin[1], gpu_lv_bin[2], gpu_lv_bin[3], gpu_lv_bin[4], gpu_lv_bin[5]);
+    if (lvp_n < (int)(sizeof LVP_ALL / sizeof LVP_ALL[0])) LVP_ALL[lvp_n++] = LVP;
+}
+static void lvperf_summary(void)
+{
+    if (!lvp_n) return;
+    int bad = 0;
+    logm("PERF SUMMARY (%d levels): level, frames, dropped, worst ms, sound late, mixer peak | GPU ms a frame, worst | 3D scene under full size (%% of the time), smallest", lvp_n);
+    for (int i = 0; i < lvp_n; i++) {
+        const lv_perf *p = &LVP_ALL[i]; int ok = !p->dropped && !p->late;
+        bad += !ok;
+        logm("  %-3s %-40s %6d %5d %6.1f %4d %4.0f%% | %5.1f %5.1f | %3.0f%% %3.0f%%", ok ? "ok" : "BAD", p->name, p->frames, p->dropped, p->worst, p->late, p->peak * 100,
+             p->gpu_avg, p->gpu_max, p->dyn_small, p->dyn_min * 100);
+    }
+    logm("PERF SUMMARY: %d of %d levels with no dropped frame and no sound gap", lvp_n - bad, lvp_n);
+}
 static void begin_level(int set, int level, int autoplay)
 {
+    gfx_ring_watch("as a level began");
     R.set = set; R.level = level;
     R.credits = set < 0;
     R.lv = R.credits ? &CREDITS_LEVEL : &FE_SETS[set].lv[level];
@@ -1665,7 +1998,7 @@ static void begin_level(int set, int level, int autoplay)
     R.story = !R.credits && strstr(FE_SETS[set].file, "Campaign") != NULL && front_story();   /* (autoplay: Arcade, with the ghosts) */
     R.stunt = !R.credits && R.lv->sd == 1;          /* sd_level 1: StuntLevel */
     loading_begin();                                  /* the PC's loading screen */
-    snd_post("Stop_CarEngine", OBJ_CAR);
+    engine_stop();
     for (int i = 0; i < OBJ_NEMIT; i++) if (emit_slot_used[i]) { snd_stop_obj(OBJ_EMIT0 + i, 300); emit_slot_used[i] = 0; }
     load_race_level(R.lv->xml);
     load_vehicle(SAVE.vehicle);
@@ -1680,10 +2013,18 @@ static void begin_level(int set, int level, int autoplay)
     snd_set_param("CarEngine_Volume", 1.0f);
     snd_set_param("CarEngineRPM", 0.1f);
     snd_set_param("Heat_Level", 0.0f);
-    snd_post("Play_CarEngine", OBJ_CAR);
+    engine_play();
     R.cam_mode = 0;
     ghosts_dirty = 1;
+    /* the level's local score table read now (kept in memory from here on): the finish line looks it up, and a
+     * read from the memory card there was a 40 ms hitch on the Vita */
+    if (!R.credits && R.lv->score) { sc_table tb; sc_get(SC_LOCAL, R.lv->xml, R.lv->score, &tb); }
+    if (ghosts_ok && !R.credits && R.lv->score) {   /* (this car's and its wreck's replay blueprints, for the finish) */
+        gh_preload(veh_ghost_name());
+        for (int i = 0; i < ngibm; i++) if (GIBM[i].ghost[0]) gh_preload(GIBM[i].ghost);
+    }
     start_race();
+    if (g_autoplay) lvperf_begin(R.lv->xml);
     (void)autoplay;
 #ifdef NR_PC
     if (getenv("LEVELCHECK")) {     /* (the PC test machine: is the level sound - the start on the ground, a finish to reach) */
@@ -1715,7 +2056,7 @@ static void explode(const char *why, int cause)
     R.boom = v3make(R.car.pos[0], R.car.pos[1], R.car.pos[2]); R.boom_t = 0.001f;
     float bp[3] = { R.boom.x, R.boom.y, R.boom.z };
     snd_set_obj_pos(OBJ_BOOM, bp);
-    snd_post("Stop_CarEngine", OBJ_CAR);              /* (CarLogic's Stop Engine Sound Event Name) */
+    engine_stop();              /* (CarLogic's Stop Engine Sound Event Name) */
     snd_post("Play_Rand_Car_Explosion", OBJ_BOOM);
     snd_post("Play_Rand_Electric_Arc", OBJ_BOOM);
     snd_set_state("Crash_States", "Crashed"); snd_set_state("Announcer_Crash", "Crashed");   /* muffled until the respawn */
@@ -1776,9 +2117,9 @@ static void frc_update(float dt)
         v3 dir = sub(want, T); float dl = len(dir);
         if (dl > 1e-4f && COLL.ntri) {               /* the static world clamps it */
             float o[3] = { T.x, T.y, T.z }, dd[3] = { dir.x / dl, dir.y / dl, dir.z / dl }, dist, n[3]; uint32_t mat;
-            uint32_t saved = COLL.ndyn; COLL.ndyn = 0;
+            COLL.no_dyn++;
             if (nr_coll_ray(&COLL, o, dd, dl, &dist, n, &mat)) want = add(T, mul(dir, dist / dl));
-            COLL.ndyn = saved;
+            COLL.no_dyn--;
         }
         FRC.pos = want; FRC.look = add(T, mul(U, 1.2f * r));
     }
@@ -1787,15 +2128,20 @@ static int frc_active(void) { return FRC.on && FRC.state >= 1; }
 
 static void run_finished(float t, int success)
 {
+    gfx_ring_watch("at the end of a run");
     gh_rec_stop(); gh_labels_fade(0);
     R.fin_stage = 0; R.fin_rank = 99; R.name_col = 0;
     if (!success || R.credits || !R.lv || !R.lv->score) return;
+    uint64_t f0 = prof_us();
     frc_start();                                     /* CampaignLevel PostUpdate 0x7110d0: the copy, FailedRunCamera */
+    uint64_t f1 = prof_us();
     sc_table tb; sc_get(SC_LOCAL, R.lv->xml, R.lv->score, &tb);
     R.fin_rank = sc_rank(&tb, t, R.score, R.biggest);
+    uint64_t f2 = prof_us();
     if (R.fin_rank <= 9) {
         char p[256]; sc_ghost_shift(R.lv->xml, R.fin_rank); sc_ghost_path(p, sizeof p, R.lv->xml, R.fin_rank);
         int ok = gh_rec_save(p) == 0;
+        logm("  (finish: results replay %.2f ms, score table %.2f ms, replay saved %.2f ms)", (f1 - f0) / 1000.0f, (f2 - f1) / 1000.0f, (prof_us() - f2) / 1000.0f);
         if (ok) ghosts_dirty = 1;
         logm("  local rank %d: replay of %d frames %s", R.fin_rank + 1, gh_rec_frames(), ok ? "saved" : "NOT saved");
     } else logm("  local rank %d (outside the ten)", R.fin_rank + 1);
@@ -1869,11 +2215,46 @@ static void update_gibs(float dt)
     }
 }
 
+/* The car's pose as drawn (and as the camera follows it). Its physics runs in steps of 5 ms (200 a second, as the PC
+ * game's), so a frame of 16.7 ms holds three steps or four: drawn where the last step left it, the car - and the whole
+ * world round the camera - moved on by 15, 15 then 20 ms a frame, an uneven judder at speed. Drawn instead between its
+ * last two steps, as far on as the time not yet stepped (R.phys_acc), it moves on by just the frame's time. It is at
+ * most one step (5 ms) behind; the physics, the race and the sounds go by the car itself. Not across a jump (a
+ * respawn, the car put back on the track) nor with the switch file "no_interp" */
+static int no_interp, no_lock;
+static float lock_T = 1.0f / 60.0f, lock_res;          /* a refresh (s); the clock's time not yet given out (frame_lock) */
+static float frame_lock(float dt)
+{
+    lock_res += dt;
+    int n = (int)(lock_res / lock_T + 0.5f);
+    if (n < 1) n = 1; else if (n > 6) n = 6;
+    const float q = n * lock_T;
+    lock_res -= q;
+    if (lock_res > lock_T) lock_res = lock_T; else if (lock_res < -lock_T) lock_res = -lock_T;
+    return q;
+}
+static void car_view(float pos[3], float rot[3][3])
+{
+    memcpy(pos, R.car.pos, 12); memcpy(rot, R.car.rot, 36);
+    if (!R.interp || no_interp) return;
+    float d2 = 0;
+    for (int k = 0; k < 3; k++) d2 += (R.car.pos[k] - R.prev_pos[k]) * (R.car.pos[k] - R.prev_pos[k]);
+    if (d2 > 4.0f * 4.0f) return;                      /* (over 800 units a second: a jump, not a step) */
+    const float a = fminf(1, fmaxf(0, R.phys_acc / NR_CAR_DT)), b = 1 - a;
+    for (int k = 0; k < 3; k++) pos[k] = R.prev_pos[k] * b + R.car.pos[k] * a;
+    v3 f = v3make(R.prev_rot[0][1] * b + R.car.rot[0][1] * a, R.prev_rot[1][1] * b + R.car.rot[1][1] * a, R.prev_rot[2][1] * b + R.car.rot[2][1] * a);
+    v3 u = v3make(R.prev_rot[0][2] * b + R.car.rot[0][2] * a, R.prev_rot[1][2] * b + R.car.rot[1][2] * a, R.prev_rot[2][2] * b + R.car.rot[2][2] * a);
+    v3 r = v3make(R.prev_rot[0][0] * b + R.car.rot[0][0] * a, R.prev_rot[1][0] * b + R.car.rot[1][0] * a, R.prev_rot[2][0] * b + R.car.rot[2][0] * a);
+    if (len(f) < 0.5f || len(u) < 0.5f) { memcpy(pos, R.car.pos, 12); return; }
+    f = norm(f); u = norm(sub(u, mul(f, dot(u, f))));                 /* (square again: forward, up, then right) */
+    r = norm(sub(sub(r, mul(f, dot(r, f))), mul(u, dot(r, u))));
+    for (int k = 0; k < 3; k++) { rot[k][0] = (&r.x)[k]; rot[k][1] = (&f.x)[k]; rot[k][2] = (&u.x)[k]; }
+}
 static void respawn_after_death(void)
 {
     respawn_point();
     rec_car_appears();                          /* CarLogic state 9: a new spawn in the recording */
-    snd_post("Play_CarEngine", OBJ_CAR);            /* (CarLogic state 9: the engine only; the warp-in is the race start's) */
+    engine_play();            /* (CarLogic state 9: the engine only; the warp-in is the race start's) */
     snd_set_state("Crash_States", "Normal"); snd_set_state("Announcer_Crash", "Normal");   /* (Respawn 0x7014d0) */
     R.rs = RS_RACE; R.alive_t = 0;
 }
@@ -1925,6 +2306,52 @@ static void stop_emitters(void)
     memset(emit_slot_used, 0, sizeof emit_slot_used);
 }
 
+static int boom_full;
+/* how many screens' worth of pixels these sprites cover, their sizes x scale (the glow's circle, 0.49 of a sprite's
+ * size, as its square on the screen, cut to the screen) */
+static float sprites_cover(const gfx_sprite *s, int n, v3 eye, v3 fwd, v3 upv, float scale)
+{
+    float fy = 2.0f * atanf(tanf((R.fov > 1 ? R.fov : 60) * 3.14159265f / 360.0f) / sqrtf(960.0f / 544.0f));
+    float ppu = 272.0f / tanf(fy * 0.5f), cover = 0;
+    v3 rt = norm(cross(fwd, upv)), up = cross(rt, fwd);
+    for (int i = 0; i < n; i++) {
+        v3 d = sub(s[i].pos, eye);
+        float along = dot(d, fwd), r = 0.49f * s[i].size * scale;
+        if (along < 0.15f) continue;                               /* past the near plane: not drawn */
+        float cx = 480 + dot(d, rt) * ppu / along, cy = 272 - dot(d, up) * ppu / along, rp = r * ppu / along;
+        float x0 = fmaxf(0, cx - rp), x1 = fminf(960, cx + rp), y0 = fmaxf(0, cy - rp), y1 = fminf(544, cy + rp);
+        if (x1 > x0 && y1 > y0) cover += (x1 - x0) * (y1 - y0) / (960.0f * 544.0f);
+    }
+    return cover;
+}
+
+/* sprites as one (the explosion's, close to the camera): the ones in front of the camera, as one glow round them on the
+ * screen (its middle that of the box they fill there, wide enough for the farthest edge) at the nearest one's depth,
+ * their colours added up. Returns how many sprites are left (0 or 1) */
+static int sprites_merge(gfx_sprite *s, int n, v3 eye, v3 fwd, v3 upv)
+{
+    float fy = 2.0f * atanf(tanf((R.fov > 1 ? R.fov : 60) * 3.14159265f / 360.0f) / sqrtf(960.0f / 544.0f));
+    float ppu = 272.0f / tanf(fy * 0.5f);
+    v3 rt = norm(cross(fwd, upv)), up = cross(rt, fwd);
+    float cx[32], cy[32], rp[32], dmin = 1e9f, x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, r = 0, g = 0, b = 0;
+    int m = 0;
+    for (int i = 0; i < n && m < 32; i++) {
+        v3 d = sub(s[i].pos, eye);
+        float along = dot(d, fwd);
+        if (along < 0.15f) continue;                               /* past the near plane: not drawn */
+        cx[m] = dot(d, rt) * ppu / along; cy[m] = dot(d, up) * ppu / along; rp[m] = 0.49f * s[i].size * ppu / along;
+        x0 = fminf(x0, cx[m] - rp[m]); x1 = fmaxf(x1, cx[m] + rp[m]); y0 = fminf(y0, cy[m] - rp[m]); y1 = fmaxf(y1, cy[m] + rp[m]);
+        dmin = fminf(dmin, along); r += s[i].r; g += s[i].g; b += s[i].b; m++;
+    }
+    if (!m) return 0;
+    float mx = 0.5f * (x0 + x1), my = 0.5f * (y0 + y1), R2 = 0;
+    for (int k = 0; k < m; k++) R2 = fmaxf(R2, sqrtf((cx[k] - mx) * (cx[k] - mx) + (cy[k] - my) * (cy[k] - my)) + rp[k]);
+    s[0].pos = add(eye, add(mul(fwd, dmin), add(mul(rt, mx * dmin / ppu), mul(up, my * dmin / ppu))));
+    s[0].size = R2 * dmin / ppu / 0.49f; s[0].angle = 0;
+    s[0].r = r; s[0].g = g; s[0].b = b;
+    return 1;
+}
+
 /* the level's objects in view (not behind the camera, not past the fog) */
 static int add_level_objects(gfx_obj *objs, int nobj, v3 eye, v3 fwd)
 {
@@ -1968,7 +2395,7 @@ static int cinema_skip(float *hold, int *armed, uint32_t buttons, float dt)
 }
 static int begin_outro(void)
 {
-    car_sounds_off(); stop_emitters(); level_sounds_exit(); snd_post("Stop_CarEngine", OBJ_CAR); snd_post("Stop_Music", 0);
+    car_sounds_off(); stop_emitters(); level_sounds_exit(); engine_stop(); snd_post("Stop_Music", 0);
     loading_begin();
     gfx_redblue_init();                               /* (before the level: its programs are prewarmed with it) */
     int lok = load_race_level("core_demo");
@@ -2032,20 +2459,20 @@ static int outro_frame(float dt, uint32_t buttons, uint32_t pressed)
     snd_set_listener(lis, lf, lu);
     if (objs_on) update_obj_sounds(eye);
     update_emitters(eye);
-    if (particles_ok) { run_emitters(eye, fwd, dt); particles_update(dt); }
+    if (particles_ok) { particles_update(dt); run_emitters(eye, fwd, dt); }
     static gfx_obj objs[MAX_DRAWOBJ]; memset(objs, 0, sizeof objs);
     int nobj = add_level_objects(objs, 0, eye, fwd);
     gfx_post post; memset(&post, 0, sizeof post);
     gfx_time += dt;
     dyn_res_step(dt, SAVE.dyn_res);
-    gfx_draw_frame(&L, eye, fwd, up, 45, objs, nobj, NULL, 0, &post);       /* corespincam: FOV 45 */
+    if (!nodraw) gfx_draw_frame(&L, eye, fwd, up, 45, objs, nobj, NULL, 0, &post);       /* corespincam: FOV 45 */
     hud_begin();
     if (OUT.bright < 1) hud_rect(0, 0, 960, 544, (unsigned)(fminf(1, 1 - OUT.bright) * 255));   /* the screen's brightness */
     cin_draw();                                       /* hud_cinema: the typed terminal lines (CityRestoring) */
     cin_skip_draw();
     ui_popup_update(dt); ui_popup_draw();             /* (the Avenger's "Vehicle Unlocked") */
     hud_end();
-    vglSwapBuffers(GL_FALSE);
+    frame_swap();
     return 0;
 }
 
@@ -2060,7 +2487,7 @@ static int story_set_index(void)
 }
 static int begin_intro(void)
 {
-    car_sounds_off(); stop_emitters(); level_sounds_exit(); snd_post("Stop_CarEngine", OBJ_CAR); snd_post("Stop_Music", 0);
+    car_sounds_off(); stop_emitters(); level_sounds_exit(); engine_stop(); snd_post("Stop_Music", 0);
     loading_begin();
     gfx_redblue_init();
     int lok = load_race_level("core_demo");
@@ -2100,7 +2527,7 @@ static int intro_frame(float dt, uint32_t buttons, uint32_t pressed)
     snd_set_listener(cv.eye, cv.fwd, cv.up);
     if (objs_on) update_obj_sounds(eye);
     update_emitters(eye);
-    if (particles_ok) { run_emitters(eye, fwd, dt); particles_update(dt); }
+    if (particles_ok) { particles_update(dt); run_emitters(eye, fwd, dt); }
     static gfx_obj objs[MAX_DRAWOBJ]; memset(objs, 0, sizeof objs);
     int nobj = add_level_objects(objs, 0, eye, fwd);
     redblue_set(cv.f2, cv.f3);
@@ -2108,13 +2535,13 @@ static int intro_frame(float dt, uint32_t buttons, uint32_t pressed)
     post.gain = cv.bright > 1 ? cv.bright - 1 : 0;    /* the eye's flashes: the scene at 1.5 */
     gfx_time += dt;
     dyn_res_step(dt, SAVE.dyn_res);
-    gfx_draw_frame(&L, eye, fwd, up, 45, objs, nobj, NULL, 0, &post);
+    if (!nodraw) gfx_draw_frame(&L, eye, fwd, up, 45, objs, nobj, NULL, 0, &post);
     hud_begin();
     if (cv.bright < 1) hud_rect(0, 0, 960, 544, (unsigned)(fminf(1, 1 - cv.bright) * 255));
     cin_draw();
     cin_skip_draw();
     hud_end();
-    vglSwapBuffers(GL_FALSE);
+    frame_swap();
     return done || skip;
 }
 
@@ -2420,97 +2847,342 @@ static void fatal_screen(void)
     sceKernelExitProcess(0);
 }
 
-/* Dynamic Resolution (Options, on by default): when frames start taking three of the screen's
- * refreshes (under 30 fps) the 3D scene is drawn smaller, 5% at a time down to 70%, and it grows
- * back after a calm spell; at 30 fps and above nothing changes, so the picture stays full size
- * wherever the Vita keeps up. A step up that brings the slow frames back makes the next try wait
- * longer (3 s doubling to 20 s). The HUD and menus are always full size. */
+/* Dynamic Resolution (Options, on by default): the 3D scene is drawn smaller - in steps of 5%, down to 60% of the
+ * screen's width and height - where the GPU would not finish a frame in time, and full size wherever it does. The HUD
+ * and menus are always full size.
+ * It goes by the GPU's own time over each frame (gputime.c): past 15 ms the scene shrinks at once by as much as brings
+ * the time back to about 14 (how much of the time follows the pixel count is learnt from each change), and it grows
+ * to the biggest size at which the last half second's worst frame would still be under 14.1 ms - so a heavy stretch
+ * is met within a frame or two, before any refresh is missed, and nothing has to be tried out to find the way back.
+ * Without those times (they stopped coming for half a second) the old way takes over: going by missed refreshes, 5% at
+ * a time down to 70%, growing back after a calm spell, a step up that brings the slow frames back making the next
+ * try wait longer (3 s doubling to 20 s). */
 static struct { float scale, win, hold, back, since_up, calm_t; int slow; } DYN = { 1, 0, 0, 3, 99, 0, 0 };
-static void dyn_res_reset(void) { DYN.scale = 1; DYN.win = DYN.hold = DYN.calm_t = 0; DYN.back = 3; DYN.since_up = 99; DYN.slow = 0; }
+static dr_t DR = { .scale = 1, .fixed = 8.0f, .up_back = 1, .since_up = 99 };
+static float gpu_last_off = -1, gpu_last_fin, gpu_last_sc, gpu_last_3d = -1;   /* (the GPU's last measured frame, for the slow frames' lines) */
+/* (the switch file "bench_hitch": the benchmark at the first race frame of a level whose 3D scene the GPU took over
+ * 50 ms with - the particles' hitches, held as they are, each way drawn again - once a level) */
+static int sw_bench_hitch; static float gpu_hitch_3d; static char hitch_lv[48];
+static void dyn_res_reset(void)
+{
+    DYN.scale = 1; DYN.win = DYN.hold = DYN.calm_t = 0; DYN.back = 3; DYN.since_up = 99; DYN.slow = 0;
+    dr_reset(&DR);
+}
 static void dyn_res_step(float dt, int on)
 {
-    if (!on) { DYN.scale = 1; gfx_scene_scale = 1; return; }
-    DYN.win += dt; DYN.since_up += dt;
-    if (dt > 0.040f && dt < 0.099f) DYN.slow++;           /* (0.1: a load or a hitch, not the drawing) */
-    if (DYN.hold > 0) DYN.hold -= dt;
-    if (DYN.win >= 0.5f) {
-        if (DYN.slow >= 2) {
-            if (DYN.since_up < 2.5f) DYN.back = fminf(DYN.back * 2, 20);
-            if (DYN.scale > 0.71f) DYN.scale -= 0.05f;
-            DYN.hold = DYN.back; DYN.calm_t = 0;
-        } else {
-            DYN.calm_t += DYN.win;
-            if (DYN.calm_t > 30) DYN.back = 3;
-            if (DYN.hold <= 0 && DYN.scale < 0.99f && DYN.calm_t >= 2) {
-                DYN.scale = fminf(1, DYN.scale + 0.05f); DYN.since_up = 0; DYN.hold = 2;
-            }
+    static float logged = 1, dr_last_ms;
+    float off, fin, sc;
+    dr_time(&DR, dt);
+    while (gt_take(&off, &fin, &sc)) {
+        /* a frame's GPU time: its 3D scene and glow passes as measured, its final pass as the set figure (what that
+         * pass's own measurement holds besides its work: gputime.c) */
+        const float ms = off + gt_final_ms + (gt_take_tag ? GT_BLUR_FINAL_MS : 0);   /* (its final pass with the speed blur: more) */
+        /* (measured before the speed blur came on, which it is now: what it will cost, ahead) */
+        const float ms_dr = ms + (!gt_take_tag && gfx_blur_drawn && bench_mode < 0 ? GT_BLUR_MS : 0);
+        gpu_sum += ms; gpu_n++; if (ms > gpu_max) gpu_max = ms;
+        gpu_fin_sum += fin;
+        if (bench_mode < 0) {
+            gpu_lv_sum += ms; gpu_lv_n++; if (ms > gpu_lv_max) gpu_lv_max = ms;
+            gpu_lv_fin_sum += fin; if (fin < gpu_lv_fin_min) gpu_lv_fin_min = fin;
+            gpu_lv_bin[ms < 13 ? 0 : ms < 14 ? 1 : ms < 15 ? 2 : ms < 16 ? 3 : ms < 17 ? 4 : 5]++;
         }
-        DYN.win = 0; DYN.slow = 0;
-        static float logged = 1;
-        if (fabsf(DYN.scale - logged) > 0.01f) { logm("  dynamic resolution: 3D scene at %.0f%%", DYN.scale * 100); logged = DYN.scale; }
+        else if (bench_frames >= BENCH_SETTLE_F + 3) { bench_gpu_sum += off; bench_gpu_fin += fin; bench_gpu_n++; if (gt_take_3d >= 0) { bench_gpu_3d += gt_take_3d; bench_gpu_n3++; } if (off + fin > bench_gpu_max) bench_gpu_max = off + fin; }
+        dr_last_ms = ms; gpu_last_off = off; gpu_last_fin = fin; gpu_last_sc = sc; gpu_last_3d = gt_take_3d;
+        if (bench_mode < 0 && gt_take_3d > gpu_hitch_3d) gpu_hitch_3d = gt_take_3d;
+        if (on) dr_sample(&DR, ms_dr, sc);
+    }
+    if (!on) { if (DR.scale < 1 || DR.npk) dr_reset(&DR); DYN.scale = 1; gfx_scene_scale = 1; gfx_lod_bias = 1; logged = 1; return; }
+    if (DR.lost < 0.5f) {
+        DYN.scale = DR.scale;                            /* (the old way starts from here, should the times stop) */
+        if (fabsf(DR.scale - logged) > 0.01f) {
+            logm("  dynamic resolution: 3D scene at %.0f%% (the GPU's last frame %.1f ms, %.1f ms of a frame taken as fixed)", DR.scale * 100, dr_last_ms, DR.fixed);
+            logged = DR.scale;
+        }
+    } else {
+        DYN.win += dt; DYN.since_up += dt;
+        if (dt > 0.022f && dt < 0.099f) DYN.slow++;           /* (a refresh missed; 0.1: a load or a hitch, not the drawing) */
+        if (DYN.hold > 0) DYN.hold -= dt;
+        if (DYN.win >= 0.5f) {
+            if (DYN.slow >= 2) {
+                if (DYN.since_up < 2.5f) DYN.back = fminf(DYN.back * 2, 20);
+                if (DYN.scale > 0.71f) DYN.scale -= 0.05f;
+                DYN.hold = DYN.back; DYN.calm_t = 0;
+            } else {
+                DYN.calm_t += DYN.win;
+                if (DYN.calm_t > 30) DYN.back = 3;
+                if (DYN.hold <= 0 && DYN.scale < 0.99f && DYN.calm_t >= 2) {
+                    DYN.scale = fminf(1, DYN.scale + 0.05f); DYN.since_up = 0; DYN.hold = 2;
+                }
+            }
+            DYN.win = 0; DYN.slow = 0;
+            if (fabsf(DYN.scale - logged) > 0.01f) { logm("  dynamic resolution: 3D scene at %.0f%% (by missed refreshes: no GPU times)", DYN.scale * 100); logged = DYN.scale; }
+        }
+        DR.scale = DYN.scale;
     }
     gfx_scene_scale = DYN.scale;
+    gfx_lod_bias = DYN.scale < 0.99f ? 2 : 1;            /* (under full size: the far objects' simpler shapes sooner) */
+    dyn_lv_frames++; if (DYN.scale < 0.99f) dyn_lv_small++;
+    if (DYN.scale < dyn_lv_min) dyn_lv_min = DYN.scale;
+}
+/* a finished frame handed to the GPU and the display (with the GPU's clock told: gputime.c) */
+static void frame_swap(void)
+{
+    gt_submit(gfx_kick_us, gfx_scale_drawn, gfx_blur_drawn);
+    vglSwapBuffers(GL_FALSE);
+    gt_confirm();
+    gfx_kick_us = 0;
 }
 
+/* where a race frame's logic goes: the time at points through it (a frame whose logic takes over 6 ms logs them) */
+enum { LP_STATE, LP_INPUT, LP_OBJECTS, LP_PHYSICS, LP_TRACKS, LP_GHOSTS, LP_CARSND, LP_CHECKPTS, LP_LEAVE, LP_CAMERA, LP_N };
+static const char *const LP_NAMES[LP_N] = { "states", "input", "objects", "car", "gibs+tracks", "ghosts", "car sounds+effects",
+    "checkpoints", "leaving", "camera" };
+static uint64_t LPT[LP_N];
+/* (the PC test machine: where the drawing setup's time goes - particles, the car's parts, ghosts, portals, objects, sparks,
+ * emitters, gibs, tracks: marks 0..8) */
+#ifdef NR_PC
+static uint64_t DST[9];
+#define DSMARK(k) (DST[k] = prof_us())
+#else
+#define DSMARK(k) ((void)0)
+#endif
+#ifdef NR_PC
+extern double nr_objs_kind_us[64]; extern int nr_objs_kind_n[64], nr_objs_prof;
+#endif
+#define LPMARK(k) (LPT[k] = prof_us())
+static uint64_t lp_c0, lp_g0;
 /* the autoplay bench (see the race's drawing): its state and its steps */
-static int bench_mode = -1, bench_frames, bench_done[2], bench_rs, bench_on;
+static int bench_mode = -1, bench_done[2], bench_rs, bench_on, bench_fin, bench_rbp; static float bench_hold_t;
 static float bench_ms; static uint64_t bench_busy0;
+static uint8_t *bench_ref, *bench_cur; static long bench_pic_n = -1; static int bench_pic_max;   /* (the pictures: bench_picture) */
 static const char *const BENCH_NAMES[] = { "everything", "no level objects", "objects: no glow pass", "objects: no solid pass",
-    "no air mines", "no CORE building", "3D scene at 70%", "no screen effects", "no speed blur", "no glowing level parts",
-    "no level geometry", "everything (again)" };
-enum { BENCH_N = 12, BENCH_SETTLE = 15, BENCH_FRAMES = 70 };
+    "no ghost cars", "ghost cars one by one", "3D scene at 50%", "no screen effects", "no speed blur", "no bloom", "old screen passes",
+    "no glowing level parts", "no level geometry", "sky and screen effects only", "GPU crossbar at 111 MHz", "no HUD",
+    "objects whole however far", "no particles", "level parts whole", "scroll glow as plain glow",
+    "scroll glow, no mip blend", "objects: four lights each", "half: scrolling glow", "half: scrolling glow, half reads",
+    "half: plain glow, smoke", "half: final pass", "half: all of those", "everything (again)",
+    "particles: no short-lived ones", "particles: no long-lived ones", "particles: no darkening ones",
+    "ghosts: solid, depth written", "ghosts: no back faces", "ghosts: the first two only",
+    "particles: all of no size", "particles: the newest quarter", "particles: in draws of 256", "particles: the oldest 3/4",
+    "particles: the window's first draw", "particles: the window's second draw", "particles: from a copy at its start",
+    "particles: from a copy in video memory", "particles: from vitaGL's own pool" };
+enum { BENCH_N = 43, BENCH_PDBG = 34, BENCH_PSHORT = 28, BENCH_GSOLID = 31, BENCH_GCULL = 32, BENCH_GTWO = 33, BENCH_SETTLE = BENCH_SETTLE_F, BENCH_FRAMES = 70, BENCH_XBAR = 14, BENCH_NOHUD = 15, BENCH_NOLOD = 16, BENCH_NOPART = 17,
+       BENCH_NORUNS = 18, BENCH_SCROLL1 = 19, BENCH_SCROLLBIL = 20, BENCH_ALLLIGHTS = 21,
+       BENCH_HSCROLL = 22, BENCH_HSCROLLR = 23, BENCH_HGLOW = 24, BENCH_HFINAL = 25, BENCH_HALL = 26 };   /* (the half-precision trial: gfx.c; as "everything" without the switch file half_test) */
+static int sw_no_lod, sw_no_runs;                    /* (the switch files no_lod, no_runs; the bench turns them off for one way) */
+/* where the bench runs: Level 5 at 2 s (its heaviest view, the CORE city and the mines), Level 1 at 10 s with the
+ * switch file "bench", and the places the switch file "bench_at" names, a "level race-time" a line - or "level fin
+ * time": that long after the finish line (the warp-out; the finish's clock held while it runs) */
+static struct { char lv[48]; float t; int done, fin; } BAT[12]; static int nbat;
+static uint64_t bench_ways = ~0ull;                  /* (the switch file "bench_ways": only the ways it lists, by number - 0 always) */
+static float bench_end_t = -1;                       /* (the race time the last bench ended at) */
+static void bench_load(int bench)
+{
+    snprintf(BAT[0].lv, sizeof BAT[0].lv, "Campaign_Level5"); BAT[0].t = 2.0f; nbat = 1;
+#ifdef NR_PC
+    if (getenv("NOBENCH")) nbat = 0;                     /* (the test machine: no built-in bench places) */
+#endif
+    if (bench) { snprintf(BAT[1].lv, sizeof BAT[1].lv, "Campaign_Level1"); BAT[1].t = 10.0f; nbat = 2; }
+    FILE *f = fopen(DATA "bench_at", "r"); char ln[96];
+    while (f && nbat < 12 && fgets(ln, sizeof ln, f)) {
+        char lv[48]; float t; int fin = 0;
+        if (sscanf(ln, "%47s fin %f", lv, &t) == 2) fin = 1;
+        else if (sscanf(ln, "%47s %f", lv, &t) != 2) continue;
+        snprintf(BAT[nbat].lv, sizeof BAT[nbat].lv, "%s", lv); BAT[nbat].t = t; BAT[nbat].fin = fin; BAT[nbat].done = 0; nbat++;
+    }
+    if (f) fclose(f);
+    bench_ways = ~0ull;
+    if ((f = fopen(DATA "bench_ways", "r"))) {
+        int w; bench_ways = 1;
+        while (fscanf(f, "%d", &w) == 1) if (w >= 0 && w < 64) bench_ways |= 1ull << w;
+        fclose(f);
+        logm("bench: only the ways the switch file bench_ways lists (0x%llx)", (unsigned long long)bench_ways);
+    }
+}
 static void bench_step(float dt)
 {
-    int bi = R.lv ? (!strcmp(R.lv->xml, "Campaign_Level1") ? 0 : !strcmp(R.lv->xml, "Campaign_Level5") ? 1 : -1) : -1;
     if (bench_mode < 0) {
-        /* (autoplay, without the switch file too: Level 5 at 2 s, its heaviest view, the CORE city and the mines) */
-        if (bi < 0 || bench_done[bi] || R.rs != RS_RACE || R.race_t < (bi == 1 ? 2.0f : 10.0f) || (bi == 0 && !bench_on)) return;
-        bench_done[bi] = 1; bench_mode = 0; bench_frames = 0; bench_rs = R.rs; R.rs = RS_PAUSE;
+        if (!R.lv || (R.rs != RS_RACE && R.rs != RS_FINISH)) { gpu_hitch_3d = 0; return; }
+        int bi = -1;
+        for (int i = 0; i < nbat && bi < 0; i++)
+            if (!BAT[i].done && !strcmp(R.lv->xml, BAT[i].lv) && (BAT[i].fin ? R.rs == RS_FINISH && R.t >= BAT[i].t : R.rs == RS_RACE && R.race_t >= BAT[i].t)) bi = i;
+        if (bi < 0 && sw_bench_hitch && R.rs == RS_RACE && gpu_hitch_3d > 50 && strcmp(hitch_lv, R.lv->xml)) {
+            static int shot;                             /* (with autoplay_shots: a picture of the frame as played first) */
+            if (test_shots && !shot) { snprintf(test_shot_req, sizeof test_shot_req, "%s_hitch", R.lv->xml); shot = 1; return; }
+            shot = 0;
+            bi = nbat < 12 ? nbat++ : 11;
+            snprintf(BAT[bi].lv, sizeof BAT[bi].lv, "%s", R.lv->xml); BAT[bi].t = R.race_t; BAT[bi].fin = 0; BAT[bi].done = 0;
+            snprintf(hitch_lv, sizeof hitch_lv, "%s", R.lv->xml);
+            logm("bench: the GPU took %.1f ms over the 3D scene - the benchmark here, at the hitch (bench_hitch)", gpu_hitch_3d);
+        }
+        gpu_hitch_3d = 0;
+        if (bi < 0) return;
+        BAT[bi].done = 1; bench_mode = 0; bench_frames = 0; bench_rs = R.rs; R.rs = RS_PAUSE;
+        /* (held as it is: the finish's clock, and - for the warp-out's stand-in and the finish camera - the state paused from) */
+        bench_fin = BAT[bi].fin; bench_hold_t = R.t; bench_rbp = R.rs_before_pause; R.rs_before_pause = bench_rs;
         vglWaitVblankStart(GL_FALSE);
-        logm("BENCH %s: the same view drawn %d frames each way, vsync off", R.lv->xml, BENCH_FRAMES - BENCH_SETTLE);
+        if (bench_fin) logm("BENCH %s %.2f s after the finish line: the same view drawn %d frames each way, vsync off", R.lv->xml, R.t, BENCH_FRAMES - BENCH_SETTLE);
+        else logm("BENCH %s at %.1f s: the same view drawn %d frames each way, vsync off", R.lv->xml, R.race_t, BENCH_FRAMES - BENCH_SETTLE);
+        if (particles_ok) particles_log();
+        gh_log_spread(pstat_log);
+        if (!gfx_half_built) logm("BENCH   (the \"half\" ways draw as \"everything\": their programs are built with the switch file half_test)");
         return;
     }
+    R.t = bench_hold_t;                                 /* (the state's clock held too: the shaders' time and the finish's) */
     uint64_t busy = T_all_busy + T_logic + T_draw + T_hud;
     bench_frames++;
     if (bench_frames == BENCH_SETTLE) { bench_ms = 0; bench_busy0 = busy; }
     else if (bench_frames > BENCH_SETTLE) bench_ms += dt * 1000;
     if (bench_frames < BENCH_FRAMES) return;
     int n = BENCH_FRAMES - BENCH_SETTLE;
-    logm("BENCH   %-28s %6.2f ms a frame (%5.1f fps), game thread busy %5.2f ms", BENCH_NAMES[bench_mode], bench_ms / n, 1000.0f * n / bench_ms,
-         (busy - bench_busy0) / 1000.0f / n);
-    bench_frames = 0;
-    if (++bench_mode >= BENCH_N) {
-        bench_mode = -1; R.rs = bench_rs;
-        GSW.no_bloom = GSW.no_wide = GSW.no_post = 0; gfx_scene_scale = 1; gfx_dbg = 0;
+    char pic[48] = "";
+    if (bench_mode == 0 && bench_ref) snprintf(pic, sizeof pic, " | picture kept");
+    else if (bench_pic_n == 0) snprintf(pic, sizeof pic, " | picture the same");
+    else if (bench_pic_n > 0) snprintf(pic, sizeof pic, " | picture: %ld px differ (by %d)", bench_pic_n, bench_pic_max);
+    bench_pic_n = -1;
+    char gpu[160] = "";                                  /* (the GPU's own clock, gputime.c: with the cap off it should come out near the frame time) */
+    if (bench_gpu_n) snprintf(gpu, sizeof gpu, ", GPU %5.2f ms (3D and glow passes %5.2f + final pass %4.2f; worst %5.2f; the 3D scene alone %5.2f)",
+                              (bench_gpu_sum + bench_gpu_fin) / bench_gpu_n, bench_gpu_sum / bench_gpu_n, bench_gpu_fin / bench_gpu_n, bench_gpu_max,
+                              bench_gpu_n3 ? bench_gpu_3d / bench_gpu_n3 : -1.0f);
+    logm("BENCH   %-32s %6.2f ms a frame (%5.1f fps)%s, game thread busy %5.2f ms | draws %d (%d instanced), tris %d, objects %d%s",
+         BENCH_NAMES[bench_mode], bench_ms / n, 1000.0f * n / bench_ms, gpu, (busy - bench_busy0) / 1000.0f / n, gfx_draws, gfx_inst_draws, gfx_tris, gfx_objs_drawn, pic);
+    bench_frames = 0; bench_gpu_sum = bench_gpu_max = bench_gpu_fin = bench_gpu_3d = 0; bench_gpu_n = bench_gpu_n3 = 0;
+    const int was = bench_mode;
+    do bench_mode++; while (bench_mode < BENCH_N && !(bench_ways >> bench_mode & 1));
+#ifndef NR_PC
+    if (was == BENCH_XBAR || bench_mode == BENCH_XBAR) {  /* (the crossbar variant: 111 MHz for it, back after) */
+        scePowerSetGpuXbarClockFrequency(bench_mode == BENCH_XBAR ? 111 : (has_switch("xbar111") ? 111 : 166));
+        /* (the way after it - no HUD - came out as slow as it: a second more to settle, and the clock as read back) */
+        if (was == BENCH_XBAR) { bench_frames = -60; logm("BENCH   (crossbar back at %d MHz)", scePowerGetGpuXbarClockFrequency()); }
+    }
+#endif
+    if (bench_mode >= BENCH_N) {
+        bench_mode = -1; R.rs = bench_rs; R.rs_before_pause = bench_rbp; bench_fin = 0; bench_end_t = R.race_t;
+        GSW.no_bloom = GSW.no_wide = GSW.no_post = 0; gfx_scene_scale = 1; gfx_dbg = 0; bench_no_particles = 0; particles_skip = sw_part_skip; gfx_part_dbg = sw_part_dbg; gh_no_merge = 0; gh_max_draw = 0; gfx_half_use(0);
+        gfx_bench_restore();
+        GSW.no_lod = sw_no_lod; GSW.no_runs = sw_no_runs;
         vglWaitVblankStart(GL_TRUE);
+        free(bench_ref); free(bench_cur); bench_ref = bench_cur = NULL;
     }
 }
+/* the finished picture of each way, read back on its last frame before the timing (the race and the shaders' clock
+ * are held): the first way's kept, the others compared with it - the ways that only draw the same picture some other
+ * way (the objects' four-light shaders, the parts whole, everything again) must match it on the Vita's GPU too */
+static void bench_picture(void)
+{
+    if (bench_mode < 0 || bench_frames != BENCH_SETTLE - 1) return;
+    const size_t sz = (size_t)960 * 544 * 4;
+    if (!bench_ref) { bench_ref = malloc(sz); bench_cur = malloc(sz); if (!bench_ref || !bench_cur) { free(bench_ref); free(bench_cur); bench_ref = bench_cur = NULL; return; } }
+    uint8_t *px = bench_mode == 0 ? bench_ref : bench_cur;
+    glReadPixels(0, 0, 960, 544, GL_RGBA, GL_UNSIGNED_BYTE, px);
+#ifdef NR_PC
+    if (getenv("BENCHPIC")) {                            /* (the test machine: each way's picture, as bench_<way>.ppm in that folder) */
+        static int nb; static float lt = -1; if (bench_hold_t != lt) { lt = bench_hold_t; nb++; }
+        char fn[256]; snprintf(fn, sizeof fn, "%s/bench%d_%02d.ppm", getenv("BENCHPIC"), nb, bench_mode);
+        FILE *f = fopen(fn, "wb");
+        if (f) { fprintf(f, "P6\n960 544\n255\n"); for (int y = 543; y >= 0; y--) for (int x = 0; x < 960; x++) fwrite(px + ((size_t)y * 960 + x) * 4, 1, 3, f); fclose(f); }
+    }
+#endif
+    if (bench_mode == 0) {                               /* (with autoplay_shots: the view kept, to compare builds) */
+        if (test_shots && R.lv) { char nm[80]; snprintf(nm, sizeof nm, "%s_bench", R.lv->xml); test_shot_save(nm, px); }
+        return;
+    }
+    long n = 0; int mx = 0;
+    for (size_t i = 0; i < sz; i += 4) {
+        int d = 0;
+        for (int k = 0; k < 3; k++) { int e = abs((int)px[i + k] - (int)bench_ref[i + k]); if (e > d) d = e; }
+        if (d) { n++; if (d > mx) mx = d; }
+    }
+    bench_pic_n = n; bench_pic_max = mx;
+}
 
+/* the loading report's clock: the game's (on the test machine read without moving it on - each reading of its clock
+ * there adds a microsecond, and runs would no longer repeat) */
+static void io_note_line(const char *l) { logm("%s", l); }   /* (the file thread's lines) */
+static uint64_t pak_clock(void)
+{
+#ifdef NR_PC
+    extern uint64_t nrpc_clock_peek(void);
+    return nrpc_clock_peek();
+#else
+    return now_us();
+#endif
+}
+#ifndef NR_PC
+static int has_switch_xbar111;                       /* (switch file "xbar111": the crossbar left at 111 MHz) */
+#endif
 int main(void)
 {
     t0 = now_us();
+    nr_pak_clock = pak_clock;                              /* (the loading report's clock) */
+#ifdef NR_PC
+    if (getenv("GFXDBG")) gfx_dbg = atoi(getenv("GFXDBG"));   /* (the test machine: gfx.c's debug switches) */
+    if (getenv("GHNOMERGE")) gh_no_merge = atoi(getenv("GHNOMERGE"));
+#endif
     sceIoMkdir(DATA, 0777);
-    io_init(DATA "boot.log"); g_log = 1;
+    io_init(DATA "boot.log"); io_note = io_note_line; g_log = 1;
     logm("Nitronic Rush Vita, build " NR_BUILD_LABEL " (" __DATE__ " " __TIME__ ")");
 #ifndef NR_PC
     /* the clocks the user chose: CPU 444, bus 222, GPU 222 MHz - the most a retail game may ask for
-     * (homebrew starts at CPU 333 / GPU 111); the GPU crossbar stays at its default */
+     * (homebrew starts at CPU 333 / GPU 111); and the GPU crossbar (its memory side) at 166 MHz, also the most a
+     * retail game may ask for (111 by default): the screen passes, textures and blending read and write memory */
     int cpu_set = scePowerSetArmClockFrequency(444), bus_set = scePowerSetBusClockFrequency(222), gpu_set = scePowerSetGpuClockFrequency(222);
-    logm("clocks: CPU %d MHz (0x%08x), bus %d MHz (0x%08x), GPU %d MHz (0x%08x), GPU crossbar %d MHz",
+    has_switch_xbar111 = has_switch("xbar111");
+    int xbar_set = has_switch_xbar111 ? 0 : scePowerSetGpuXbarClockFrequency(166);
+    logm("clocks: CPU %d MHz (0x%08x), bus %d MHz (0x%08x), GPU %d MHz (0x%08x), GPU crossbar %d MHz (0x%08x)",
          scePowerGetArmClockFrequency(), cpu_set, scePowerGetBusClockFrequency(), bus_set, scePowerGetGpuClockFrequency(), gpu_set,
-         scePowerGetGpuXbarClockFrequency());
+         scePowerGetGpuXbarClockFrequency(), xbar_set);
 #endif
     GSW.no_mips = has_switch("no_mips"); GSW.rgba = has_switch("rgba_tex");
     GSW.no_fog = has_switch("no_fog"); GSW.no_cutout = has_switch("no_cutout");
     GSW.no_cull = has_switch("no_cull"); GSW.no_tex_cache = has_switch("no_tex_cache");
     GSW.discard = has_switch("discard_cutout"); GSW.no_transfer_wait = has_switch("no_transfer_wait");
+    GSW.mip_in_order = has_switch("mip_in_order"); GSW.tex_ab = has_switch("tex_ab"); GSW.tex_check = has_switch("tex_check"); GSW.tex_redo_test = has_switch("tex_redo_test");
     GSW.cg = has_switch("cg_shaders");
     GSW.no_post = has_switch("no_post"); GSW.no_bloom = has_switch("no_bloom");
+    GSW.no_inst = has_switch("no_instancing");
+    GSW.no_lod = has_switch("no_lod");               /* (the moving objects drawn whole however far: to compare) */
+#ifdef NR_PC
+    if (getenv("NOLOD")) GSW.no_lod = 1;
+#endif
+    sw_no_lod = GSW.no_lod;
+    GSW.no_runs = has_switch("no_runs");             /* (the level's big parts drawn whole: to compare) */
+#ifdef NR_PC
+    if (getenv("NORUNS")) GSW.no_runs = 1;
+#endif
+    sw_no_runs = GSW.no_runs;
+#ifdef NR_PC
+    boom_full = getenv("BOOMFULL") != NULL;           /* (the explosion's glows at their full size however close: to compare) */
+#endif
     int sw_no_bloom = GSW.no_bloom;
     int autoplay = has_switch("autoplay"), no_sound = has_switch("no_sound");
     bench_on = has_switch("bench");
+    bench_load(bench_on);
     int nocap = has_switch("nocap");
+    no_interp = has_switch("no_interp");
+    if (has_switch("snd_evlog")) snd_evlog = snd_log_line;     /* (every sound event posted, into the log) */
+    {   FILE *ff = fopen(DATA "snd_flicker", "r");
+        if (ff) { if (!fgets(snd_flicker, sizeof snd_flicker, ff)) snd_flicker[0] = 0; fclose(ff);
+                  snd_flicker[strcspn(snd_flicker, "\r\n ")] = 0; if (snd_flicker[0]) logm("switches: snd_flicker %s", snd_flicker); } }
+#ifdef NR_PC
+    if (getenv("NOINTERP")) no_interp = 1;
+#endif
+    no_lock = has_switch("no_lock");
+#ifndef NR_PC
+    {   float hz = 0; if (sceDisplayGetRefreshRate(&hz) >= 0 && hz > 50 && hz < 70) lock_T = 1.0f / hz;
+        logm("display: %.3f Hz%s%s", 1.0f / lock_T, no_lock ? " (no_lock: the frame's time as the clock gives it)" : "", no_interp ? " (no_interp)" : ""); }
+#endif
+    sw_no_particles = has_switch("no_particles");
+    sw_part_skip = switch_num("particles_skip", 0); particles_skip = sw_part_skip; sw_bench_hitch = has_switch("bench_hitch");
+    if (has_switch("part_dump")) { sceIoMkdir(DATA "test_shots", 0777); particles_dump = DATA "test_shots/pring"; }   /* (downloaded as the test pictures are) */
+    gfx_part_dbg = sw_part_dbg = switch_num("part_dbg", 0); sw_auto_secs = switch_num("autoplay_secs", 0);
+    if (sw_part_skip || gfx_part_dbg || sw_auto_secs) logm("switches: particles_skip %d, part_dbg %d, autoplay_secs %d", sw_part_skip, gfx_part_dbg, sw_auto_secs);
     chase_wanted = has_switch("chase");
+    int autoplay_all = autoplay && has_switch("autoplay_all");   /* (every level of every set, not only the story's) */
+#ifdef NR_PC
+    if (getenv("AUTOPLAY_ALL")) autoplay_all = autoplay;
+#endif
+    g_autoplay_all = autoplay_all;
 #ifdef NR_PC
     if (getenv("CHASE")) chase_wanted = 1;
     if (getenv("NODRAW")) nodraw = 1;
@@ -2521,16 +3193,55 @@ int main(void)
     test_shots = autoplay && has_switch("autoplay_shots");
     if (test_shots) sceIoMkdir(DATA "test_shots", 0777);
     SceGxmMultisampleMode ms = has_switch("msaa4x") ? SCE_GXM_MULTISAMPLE_4X : has_switch("msaa2x") ? SCE_GXM_MULTISAMPLE_2X : SCE_GXM_MULTISAMPLE_NONE;
-    logm("switches: autoplay=%d no_sound=%d no_mips=%d rgba_tex=%d no_fog=%d no_cull=%d msaa=%d no_post=%d no_bloom=%d", autoplay, no_sound,
-         GSW.no_mips, GSW.rgba, GSW.no_fog, GSW.no_cull, (int)ms, GSW.no_post, GSW.no_bloom);
+    logm("switches: autoplay=%d no_sound=%d no_mips=%d rgba_tex=%d no_fog=%d no_cull=%d msaa=%d no_post=%d no_bloom=%d autoplay_all=%d nocap=%d chase=%d no_particles=%d",
+         autoplay, no_sound, GSW.no_mips, GSW.rgba, GSW.no_fog, GSW.no_cull, (int)ms, GSW.no_post, GSW.no_bloom, autoplay_all, nocap, chase_wanted, sw_no_particles);
+    if (GSW.no_inst) logm("switches: no_instancing");
+    if (GSW.no_lod) logm("switches: no_lod");
+    if (GSW.no_runs) logm("switches: no_runs");
     gfx_set_log(logm);
     /* the game thread (logic, physics and the GL calls) keeps core 0 to itself: the sound mixer
      * and the file loader live on the other cores (see snd_init) */
     int pin = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
 
+    {   /* the GPU's parameter buffer (the scene's vertices after the vertex shaders, binned into tiles): 16 MB by default;
+         * the switch file "param_mb" (its number: MB, 8 to 64) sets another size, to measure what it holds back */
+        FILE *pf = fopen(DATA "param_mb", "r"); int mb = 0;
+        if (pf) { if (fscanf(pf, "%d", &mb) != 1) mb = 0; fclose(pf); }
+        if (mb >= 8 && mb <= 64) { vglSetParamBufferSize((uint32_t)mb << 20); logm("parameter buffer %d MB", mb); }
+    }
+    /* (the switch file "double_buffer": two screen buffers, not vitaGL's three. With three and the 60 fps cap the game
+     * runs two frames ahead of the screen - a picture shows three refreshes after its input was read; with two it is
+     * one ahead - two refreshes - but a frame the GPU is late with has a refresh less to make up in. To try) */
+    if (has_switch("double_buffer")) { vglUseTripleBuffering(GL_FALSE); logm("switches: double_buffer (two screen buffers)"); }
     vglInitExtended(0, 960, 544, 32 * 1024 * 1024, ms);
     vglWaitVblankStart(GL_TRUE);
-    logm("vitaGL up, free memory %.1f MB", vglMemFree(VGL_MEM_ALL) / 1048576.0);
+    logm("vitaGL up, free video memory %.1f MB, GPU main memory %.1f MB", vglMemFree(VGL_MEM_VRAM) / 1048576.0, vglMemFree(VGL_MEM_RAM) / 1048576.0);
+    {   /* (the switch file "dynres": the dynamic resolution's limits to try - shrink past, down to, grow under (ms),
+         * smallest - and, a fifth number, the GPU time the final pass is counted as) */
+        FILE *df = fopen(DATA "dynres", "r"); float a, b, c, d, e = GT_FINAL_MS;
+        if (df) {
+            if (fscanf(df, "%f %f %f %f %f", &a, &b, &c, &d, &e) >= 4 && a > 8 && b > 7 && b < a && c > 6 && c <= b && d >= 0.5f && d <= 1 && e >= 0 && e < 8) {
+                dr_hi = a; dr_goal = b; dr_up = c; dr_min = d; gt_final_ms = e;
+                logm("dynamic resolution: shrinking past %.1f ms to %.1f, growing under %.1f, not below %.0f%% (the final pass counted as %.1f ms)", a, b, c, d * 100, e);
+            }
+            fclose(df);
+        }
+    }
+    gt_init(logm);
+#ifndef NR_PC
+    {   /* (the switch file "shader_opts": the Vita's shader compiler's settings to try - "level fastmath fastprecision
+         * fastint", vitaGL's own being 3 1 0 1. Programs built with other settings are kept apart in the cache) */
+        FILE *sf = fopen(DATA "shader_opts", "r"); int o, fm, fp, fi;
+        if (sf) {
+            if (fscanf(sf, "%d %d %d %d", &o, &fm, &fp, &fi) == 4 && o >= 0 && o <= 4) {
+                vglSetupRuntimeShaderCompiler((shark_opt)o, fm != 0, fp != 0, fi != 0);
+                gfx_shader_opts = 0x100u | (unsigned)o << 4 | (fm != 0) << 2 | (fp != 0) << 1 | (fi != 0);
+                logm("shader compiler: level %d, fastmath %d, fastprecision %d, fastint %d (the switch file shader_opts)", o, fm != 0, fp != 0, fi != 0);
+            }
+            fclose(sf);
+        }
+    }
+#endif
     int r = nr_pak_open(&pak, DATA "nitronic.idx");
     if (r) { logm("cannot open " DATA "nitronic.idx (%d)", r); fatal_screen(); }
     logm("data: %d packs, %u files", pak.nf, pak.count);
@@ -2539,16 +3250,35 @@ int main(void)
     /* the loading screen while the shaders are built (the first start after an update takes about
      * 25 s) and the menu, the car and the sounds load, rather than a black screen */
     if (hud_ok) loading_begin();
+    gfx_half_trial = has_switch("half_test");       /* (the half-precision trial's programs, for the bench: gfx.c) */
+    gfx_half_final = !has_switch("full_final");      /* (the final pass in half precision: gfx.c) */
+    gfx_half_all = has_switch("half_all");          /* (the game's own fragment shaders in Cg, half precision: gfx.c) */
     if (gfx_init()) { logm("no usable shaders"); fatal_screen(); }
     {   /* the HUD's and the popups' textures now, not when first shown in a race (a hitch) */
         static const char *PRE[] = { "hud", "hud_heat", "hud_flame", "countdown_1", "countdown_2", "countdown_3", "countdown_rush",
-            "countdown_1_line", "countdown_2_line", "countdown_3_line", "countdown_rush_line", "achievement_unlocked", "vehicle_unlocked",
+            "countdown_1height", "countdown_2height", "countdown_3height", "countdown_rushheight", "achievement_unlocked", "vehicle_unlocked",
             "new_level_unlocked", "trophy_gold", "trophy_silver", "trophy_bronze", "loading2", "menu_button", "menu_button2",
-            "menu_button_new", "menu_toggle", "menu_slider", "menu_sliderbar", "rush4" };
+            "menu_button_new", "menu_toggle", "menu_slider", "menu_sliderbar", "rush4", "levelimage_none", "levelimage_border",
+            "levelimage_locked" };
         for (unsigned k = 0; k < sizeof PRE / sizeof PRE[0]; k++) hud_tex(PRE[k]);
     }
     if (autoplay) SAVE_PATH = DATA "save_autoplay.txt";
     save_load(&SAVE, SAVE_PATH);
+    if (has_switch("sndbench")) {   /* (the mixer's benchmark: the recordings the switch file names, one a line, then quit) */
+        int sr = snd_init(&pak, 0);
+        FILE *f = fopen(DATA "sndbench", "r"); char ln[128];
+        logm("sndbench: %s", sr ? "no sound data" : "the mixer alone, on the game's core");
+        while (!sr && f && fgets(ln, sizeof ln, f)) {
+            ln[strcspn(ln, "\r\n")] = 0;
+            if (!ln[0]) continue;
+            char path[200]; snprintf(path, sizeof path, "%s%s", ln[0] == 'u' && strchr(ln, ':') ? "" : DATA, ln);
+            snd_bench(path, NULL, snd_log_line);
+        }
+        if (f) fclose(f);
+        logm("sndbench finished");
+        io_shutdown(); g_log = 0;
+        sceKernelExitProcess(0);
+    }
     if (!no_sound) {
         int sr = snd_init(&pak, 1);
         logm(sr ? "sound: no sound data (%d)" : "sound engine running", sr);
@@ -2620,31 +3350,96 @@ int main(void)
     int auto_screen = 0, auto_level = 0; float auto_t = 0;
     int auto_set = 0, auto_outro = 0, auto_intro = 0, auto_credits2 = 0, auto_cmd = 0;
     for (int s = 0; s < FE_NSETS; s++) if (strstr(FE_SETS[s].file, "Campaign")) auto_set = s;
+    /* (autoplay_all may name the level sets to drive, "first last" (0-based): the test in parts) */
+    int all_last = FE_NSETS - 1;
+    if (autoplay_all) {
+        auto_set = 0;
+        FILE *f = fopen(DATA "autoplay_all", "r"); int a = -1, b = -1;
+        if (f) { if (fscanf(f, "%d %d", &a, &b) < 1) a = -1; fclose(f); }
+        if (a >= 0 && a < FE_NSETS) { auto_set = a; all_last = b >= a && b < FE_NSETS ? b : a; }
+        logm("autoplay: every level of sets %d to %d", auto_set, all_last);
+        if (auto_set > 0) auto_screen = (int)(sizeof AUTO_SCREENS / sizeof AUTO_SCREENS[0]);   /* (the menus: in the first part) */
+    }
 #ifdef NR_PC
-    if (getenv("AUTOPLAY_ALL")) auto_set = 0;
     if (getenv("AUTOPLAY_NOMENU")) auto_screen = (int)(sizeof AUTO_SCREENS / sizeof AUTO_SCREENS[0]);
-    if (getenv("AUTOPLAY_FROM")) { auto_level = atoi(getenv("AUTOPLAY_FROM")); auto_intro = 1; }   /* (the PC test machine: start at this level of the set) */
+    if (getenv("AUTOPLAY_FROM")) { auto_level = atoi(getenv("AUTOPLAY_FROM")); auto_intro = !strchr(getenv("AUTOPLAY_FROM"), 'i'); }   /* (the PC test machine: start at this level of the set; "1i": the story's intro first) */
 #endif
+    /* (the switch file "autoplay_level", with autoplay: only the levels it names, one level file name a line - e.g.
+     * Evil_Carwash - driven along the developers' run without the menu tour, then the game quits) */
+    static char only_lv[32][56]; int n_only = 0, i_only = 0;   /* (up to 32 levels a run) */
+    if (autoplay) {
+        FILE *f = fopen(DATA "autoplay_level", "r");
+        if (f) {
+            char ln[96];
+            while (n_only < 32 && fgets(ln, sizeof ln, f)) {
+                char *e = ln + strcspn(ln, "\r\n"); *e = 0;
+                if (e - ln > 4 && !strcasecmp(e - 4, ".xml")) e[-4] = 0;
+                if (ln[0]) snprintf(only_lv[n_only++], sizeof only_lv[0], "%s", ln);
+            }
+            fclose(f);
+        }
+        if (n_only) auto_screen = (int)(sizeof AUTO_SCREENS / sizeof AUTO_SCREENS[0]);
+    }
 
     uint32_t prev_buttons = 0;
     uint64_t last = now_us(), win_start = last;
     int win_frames = 0, win_over = 0; float win_worst = 0, win_cpu = 0;
-    static float win_gpu, win_gpu_sum; static int win_gpu_n;
     int vsync_on = 1, quit_app = 0;
     float rep_t = 0; int rep_dir = 0;
     int t_down = 0, t_moved = 0; float t_x0 = 0, t_y0 = 0, t_sx = 0, t_sy = 0, t_time = 0;   /* the finger on the touch screen */
     float play_time_acc = 0;
 
     for (;;) {
+#ifndef NR_PC
+        /* the system says when its UI is over the game (isSystemUiOverlaid) - but not only for the quick menu: the test
+         * machine's screenshots set it for two minutes at a time, and slowing the game down then spoilt every measuring
+         * run, so it is only logged. (Holding the PS button over a test running without the 60 fps cap once locked up the
+         * whole Vita: the tests are left alone while they run) */
+        {   static int chk;
+            if (++chk >= 30) {
+                chk = 0; SceAppMgrAppState as; memset(&as, 0, sizeof as);
+                int was = sys_menu;
+                int r = _sceAppMgrGetAppState(&as, sizeof as, 0x03570011);
+                sys_menu = r == 0 && as.isSystemUiOverlaid;
+                if (sys_menu != was) logm("  system UI over the game: %s", sys_menu ? "yes" : "no");
+                /* the Vita's own sleep after some minutes with no buttons pressed (a long race steered on the stick
+                 * alone, the menu, the credits) is held off, every half a second */
+                sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+                /* and the clocks: the system can lower them (after the Vita has slept, or the PS button), and the GPU
+                 * at its default 111 MHz would halve the frame rate for the rest of the run - set again when found
+                 * lowered (8 times at most: a system that keeps them down is left alone) */
+                static int clock_fix;
+                if (clock_fix < 8 && bench_mode != BENCH_XBAR &&
+                    (scePowerGetArmClockFrequency() < 444 || scePowerGetBusClockFrequency() < 222 || scePowerGetGpuClockFrequency() < 222 ||
+                     (!has_switch_xbar111 && scePowerGetGpuXbarClockFrequency() < 166))) {
+                    clock_fix++;
+                    logm("clocks found lowered (CPU %d, bus %d, GPU %d, GPU crossbar %d MHz): set again (%d)",
+                         scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency(),
+                         scePowerGetGpuXbarClockFrequency(), clock_fix);
+                    scePowerSetArmClockFrequency(444); scePowerSetBusClockFrequency(222); scePowerSetGpuClockFrequency(222);
+                    if (!has_switch_xbar111) scePowerSetGpuXbarClockFrequency(166);
+                }
+            }
+        }
+#endif
         uint64_t tn = now_us();
         float dt = (tn - last) / 1e6f; last = tn;
         if (dt > 0.1f) dt = 0.1f;
         R.frame++;
+#ifndef NR_PC
+        /* With the 60 fps cap on, every picture is on the screen for a whole number of refreshes, but the clock's time
+         * between two passes of this loop is not: the loop runs up to two frames ahead and waits on a free screen buffer
+         * for however long it takes (13.9 ms, then 19.2 ...). Moved on by that, the game would be uneven on a steady
+         * screen. So the time is given out a refresh at a time (frame_lock), what is left over carried to the next
+         * frame: the same total, in the screen's steps. (Not with the cap off - the bench, nocap runs - nor no_lock) */
+        if (vsync_on && !no_lock) dt = frame_lock(dt); else lock_res = 0;
+#endif
         if (bench_mode < 0) GSW.no_bloom = sw_no_bloom || !SAVE.bloom;   /* Options: Toggle Bloom */
 #ifndef NR_PC
         {   /* (switch file "nocap": autoplay races with the 60 fps cap off, each frame taking what it really costs, so the
              * log shows how much room every stretch has; tearing shows. Otherwise the test runs as the game is played) */
             int want = !(autoplay && nocap && !bench_on && (mode == MODE_RACE || mode == MODE_OUTRO || mode == MODE_INTRO));
+            if (bench_mode >= 0) want = 0;             /* (the bench draws with vsync off: it was put back on each frame without nocap) */
             if (want != vsync_on) { vglWaitVblankStart(want ? GL_TRUE : GL_FALSE); vsync_on = want; }
         }
 #endif
@@ -2654,13 +3449,14 @@ int main(void)
             if (SAVE.play_time > 3600) ach_unlock("Rush Hour");
         }
         /* the PC shaders' clocks: Time (0..1, 0.05 a second) and the seconds since the music's beat */
-        gfx_T += dt * 0.05f; if (gfx_T > 1.0f) gfx_T -= 1.0f;
+        if (bench_mode < 0) { gfx_T += dt * 0.05f; if (gfx_T > 1.0f) gfx_T -= 1.0f; }   /* (held in the bench: its pictures compared) */
 
         SceCtrlData pad; memset(&pad, 0, sizeof pad);
         sceCtrlPeekBufferPositive(0, &pad, 1);
         uint32_t pressed = pad.buttons & ~prev_buttons; prev_buttons = pad.buttons;
         float lx = (pad.lx - 128) / 128.0f, ly = (pad.ly - 128) / 128.0f;
         float rx = (pad.rx - 128) / 128.0f, ry = (pad.ry - 128) / 128.0f;
+        float lx_raw = lx, ly_raw = ly, rx_raw = rx, ry_raw = ry;   /* (the camera stick has its own dead zone) */
         if (fabsf(lx) < 0.15f) lx = 0; if (fabsf(ly) < 0.15f) ly = 0;
         if (fabsf(rx) < 0.15f) rx = 0; if (fabsf(ry) < 0.15f) ry = 0;
 
@@ -2709,6 +3505,21 @@ int main(void)
                         logm("  sound: %d voices, %d decoding, mixer load %.0f%%", nv, nd, ld * 100);
                     }
                 } else if (front_screen() == FE_MAIN && ((int)(auto_t * 2) % 2) && (R.frame % 30) == 0) in.down = 1;
+            } else if (n_only) {                          /* (autoplay_level: the levels it names, then quit) */
+                int fs = -1, fl = -1;
+                while (i_only < n_only && fs < 0) {
+                    const char *want = only_lv[i_only++];
+                    for (int s = 0; s < FE_NSETS && fs < 0; s++) for (int i = 0; i < FE_SETS[s].n; i++) {
+                        char x[56]; snprintf(x, sizeof x, "%s", FE_SETS[s].lv[i].xml);
+                        size_t xl = strlen(x); if (xl > 4 && !strcasecmp(x + xl - 4, ".xml")) x[xl - 4] = 0;
+                        if (!strcasecmp(x, want) && FE_SETS[s].lv[i].installed) { fs = s; fl = i; break; }
+                    }
+                    if (fs < 0) logm("autoplay: no level %s", want);
+                }
+                if (fs < 0) break;
+                logm("autoplay: %s (%s)", FE_SETS[fs].lv[fl].name, FE_SETS[fs].name);
+                begin_level(fs, fl, 1); mode = MODE_RACE; auto_t = 0; last = now_us();
+                continue;
             } else if (auto_level < FE_SETS[auto_set].n) {
                 while (auto_level < FE_SETS[auto_set].n && !FE_SETS[auto_set].lv[auto_level].installed) auto_level++;
                 if (auto_level == 1 && !auto_intro && auto_set == story_set_index()) {   /* the story: the Tutorial, the intro, Level 1 */
@@ -2720,10 +3531,10 @@ int main(void)
                     last = now_us();
                     continue;
                 }
-#ifdef NR_PC
-            } else if (getenv("AUTOPLAY_ALL") && auto_set + 1 < FE_NSETS) {   /* (the PC test machine: every level set) */
-                auto_set++; auto_level = 0; logm("autoplay: level set %d", auto_set);
-#endif
+            } else if (autoplay_all && auto_set + 1 <= all_last) {   /* (autoplay_all: on to the next level set) */
+                auto_set++; auto_level = 0; logm("autoplay: level set %d (%s)", auto_set, FE_SETS[auto_set].name);
+            } else if (autoplay_all && all_last < FE_NSETS - 1) {
+                break;                                    /* (a part of the test that ends before the last set: no ending) */
             } else if (!auto_outro) {                     /* after the story: the ending, then the credits */
                 auto_outro = 1;
                 if (begin_outro()) { mode = MODE_OUTRO; auto_t = 0; last = now_us(); continue; }
@@ -2748,7 +3559,7 @@ int main(void)
         }
 
         log_buffered = mode == MODE_RACE || mode == MODE_OUTRO || mode == MODE_INTRO;
-        uint64_t c0 = now_us();
+        uint64_t c0 = now_us(); lp_c0 = prof_us();
         gfx_hook_additive = mode != MODE_FRONT ? draw_particles_hook : NULL;   /* the race's particles and tracks' glow only */
         gfx_hook_decal = mode == MODE_RACE ? draw_decal_hook : NULL;            /* the tracks' tread */
         if (mode != MODE_RACE) trk_nq = 0;
@@ -2776,14 +3587,14 @@ int main(void)
             front_camera(dt, &eye, &fwd, &fade);
             float lis[3] = { eye.x, eye.y, eye.z }, lf[3] = { fwd.x, fwd.y, fwd.z }, lu[3] = { 0, 0, 1 };
             snd_set_listener(lis, lf, lu);
-            gfx_scene_scale = 1;
+            dyn_res_step(dt, 0);                           /* (the menu full size; the GPU's times for the log) */
             if (front_screen() != FE_SPLASH && menu_loaded) gfx_draw_frame(&MENU, eye, fwd, v3make(0, 0, 1), 45, NULL, 0, NULL, 0, NULL);   /* menu_camera: 45 degrees */
             else { glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); }
             hud_begin();
             if (front_screen() != FE_SPLASH && fade > 0) hud_rect(0, 0, 960, 544, (unsigned)(fminf(1, fade) * 255));
             front_draw();
             hud_end();
-            vglSwapBuffers(GL_FALSE);
+            frame_swap();
             if (res == FE_PLAY && lvl == FE_LEVEL_INTRO) {                 /* "Play Tutorial?" No: the intro */
                 if (begin_intro()) mode = MODE_INTRO;
                 else { begin_level(set, 1, 0); mode = MODE_RACE; }
@@ -2804,6 +3615,27 @@ int main(void)
                 nrpc_warp = -1;
             }
             if (nrpc_wreck && R.rs == RS_RACE) { nrpc_wreck = 0; explode("test: wrecked by the script", 2); }
+            if (nrpc_flip && R.rs == RS_RACE) {         /* (the test machine: over onto the roof, to see it slide) */
+                nrpc_flip = 0;
+                float Rr[3][3], p[3] = { R.car.pos[0], R.car.pos[1], R.car.pos[2] }, v[3], w[3];
+                for (int k = 0; k < 3; k++) { Rr[k][0] = -R.car.rot[k][0]; Rr[k][1] = R.car.rot[k][1]; Rr[k][2] = -R.car.rot[k][2]; p[k] += R.car.rot[k][2] * 0.8f; }
+                memcpy(v, R.car.vel, 12); memcpy(w, R.car.angvel, 12);
+                nr_car_reset_rot(&R.car, p, Rr);
+                memcpy(R.car.vel, v, 12); memset(R.car.angvel, 0, 12); (void)w;
+                if (nr_car_speed(&R.car) < 40) for (int k = 0; k < 3; k++) R.car.vel[k] = R.car.rot[k][1] * 45.0f;   /* (standing: sent off at 45) */
+                logm("  test: flipped onto the roof at %.0f", nr_car_speed(&R.car));
+                nrpc_flip = -1;                          /* (FLIPKEEP=s: slid on at FLIPSPEED for that long) */
+            }
+            {   static float keep_t = -1, kd[3];
+                if (nrpc_flip == -1) { nrpc_flip = 0; keep_t = getenv("FLIPKEEP") ? (float)atof(getenv("FLIPKEEP")) : -1;
+                                       float h = sqrtf(R.car.vel[0] * R.car.vel[0] + R.car.vel[1] * R.car.vel[1]) + 1e-6f;
+                                       kd[0] = R.car.vel[0] / h; kd[1] = R.car.vel[1] / h; kd[2] = 0; }   /* (the way it was going) */
+                if (keep_t > 0 && R.rs == RS_RACE) {
+                    keep_t -= dt;
+                    float sp = getenv("FLIPSPEED") ? (float)atof(getenv("FLIPSPEED")) : 25.0f;
+                    for (int k = 0; k < 2; k++) R.car.vel[k] = kd[k] * sp;
+                }
+            }
             if (nrpc_aim >= 0 && R.rs == RS_RACE && nrpc_aim < OBJS.n && OBJS.o[nrpc_aim].kind == OK_BAFSAW) {
                 /* (the test machine: the car sent straight at a sliding saw, to meet it at the middle of its slot) */
                 nr_obj *o = &OBJS.o[nrpc_aim];
@@ -2827,23 +3659,36 @@ int main(void)
             int go_menu = 0, restart = 0, next = 0;
             if (autoplay) {
                 if (bench_mode < 0) auto_t += dt;
-                float auto_secs = 50;
+                float auto_secs = sw_auto_secs > 0 ? (float)sw_auto_secs : 50;
 #ifdef NR_PC
                 if (getenv("AUTOPLAY_SECS")) auto_secs = (float)atof(getenv("AUTOPLAY_SECS"));   /* (the PC test machine) */
 #endif
                 if (chase_on) auto_secs = ch_length(&CH) + 45;            /* (to the finish: the replay's time and some) */
+                if (g_autoplay_all && !chase_on && !R.credits) {          /* (each level to its end: the replay's or the route's, and 15 s on) */
+                    auto_secs = R.stunt ? 120 : pilot_on == 2 ? fminf(240, L.pathlen[L.d.npath - 1] / pilot_speed + 20) : pilot_on || pilot_coast ? 400 : 120;
+                    if (pilot_over_t >= 0 && R.race_t - pilot_over_t > 15) auto_secs = 0;
+#ifdef NR_PC
+                    if (getenv("AUTOPLAY_SECS")) auto_secs = fminf(auto_secs, (float)atof(getenv("AUTOPLAY_SECS")));   /* (the test machine: shorter) */
+#endif
+                }
+                if (!g_autoplay_all && !chase_on && R.lv) {               /* (autoplay_level: a level with bench places runs until it */
+                    float bt = -1; int pending = 0;                         /*  reaches them, and leaves 3 s after the last) */
+                    for (int i = 0; i < nbat; i++) if (!strcmp(BAT[i].lv, R.lv->xml)) { bt = fmaxf(bt, BAT[i].t); pending |= !BAT[i].done; }
+                    if (bt >= 0) auto_secs = pending ? fmaxf(auto_secs, bt + 30) : bench_mode < 0 && R.race_t >= bench_end_t + 3 ? 0 : 1e9f;
+                }
                 if (credits_stress && R.credits) auto_secs = 150;
                 if (auto_cmd == 2) auto_secs = fminf(auto_secs, 45);
 #ifdef NR_PC
                 if (audit_on && audit_n) auto_secs = audit_n * 0.06f + 8;
 #endif
                 if ((R.rs == RS_FINISH && R.t > 4) || (R.rs != RS_FINISH && auto_t > auto_secs)) {
-                    if (R.rs != RS_FINISH) { logm("RESULT %s not finished after %.0f s, checkpoints %d/%d, wrecks %d%s", R.lv->xml, auto_secs, R.cp_count, G.ncp, R.wrecks, chase_on ? ", physics drive" : ""); fx_log(); }
+                    if (R.rs != RS_FINISH) { logm("RESULT %s not finished after %.0f s, checkpoints %d/%d, wrecks %d%s", R.lv->xml, auto_t, R.cp_count, G.ncp, R.wrecks, chase_on ? ", physics drive" : ""); fx_log(); }
                     if (chase_on) logm("CHASE %s assists %d resyncs %d replay %.1f s", R.lv->xml, CH.assists, CH.resyncs, ch_length(&CH));
                     int nv, nd; float ld; snd_stats(&nv, &nd, &ld);
                     logm("  sound: %d voices, %d decoding, mixer load %.0f%%", nv, nd, ld * 100);
+                    lvperf_end();
                     auto_level++;
-                    car_sounds_off(); stop_emitters(); level_sounds_exit(); snd_post("Stop_CarEngine", OBJ_CAR);
+                    car_sounds_off(); stop_emitters(); level_sounds_exit(); engine_stop();
                     mode = MODE_FRONT; front_enter(FE_LEVELS);
                     continue;
                 }
@@ -2877,7 +3722,7 @@ int main(void)
                 else if (pa == PA_QUIT_APP) quit_app = 1;
             } else if (R.rs == RS_FINISH && R.credits) {
                 if (R.t > 4.0f) {
-                    car_sounds_off(); stop_emitters(); level_sounds_exit(); snd_post("Stop_CarEngine", OBJ_CAR); snd_post("Stop_Music", 0);
+                    car_sounds_off(); stop_emitters(); level_sounds_exit(); engine_stop(); snd_post("Stop_Music", 0);
                     front_menu_level();
                     mode = MODE_FRONT; front_enter(FE_MAIN); last = now_us();
                     continue;
@@ -2934,6 +3779,7 @@ int main(void)
                 explode("self-termination", 1);
             }
             if (R.rs != RS_PAUSE && R.rs != RS_DEAD && !autoplay && (pressed & act_mask(ACT_VIEW))) cam_switch_view();
+            LPMARK(LP_STATE);
 
             /* car input (CarLogic's inputs: CarGas, CarBrake, CarTurn, CarPitch, CarRollX/Y, CarJump,
              * CarBoost, CarWings) */
@@ -2984,7 +3830,7 @@ int main(void)
                     ci.roll_x = tx; ci.roll_y = SAVE.invert_y ? ty : -ty;
                 } else if (roll) { ci.roll_x = sx; ci.roll_y = SAVE.invert_y ? sy : -sy; }
                 else ci.pitch = SAVE.invert_y ? -sy : sy;
-                if (adv) { cam_tx = tx; cam_ty = -ty; }
+                if (adv) cam_stick(SAVE.swap_sticks ? lx_raw : rx_raw, SAVE.swap_sticks ? ly_raw : ry_raw, &cam_tx, &cam_ty);
                 {   /* the d-pad does the tricks too (each direction no action is set to): left / right roll, up / down flip,
                      * as the trick stick pushed all the way */
                     uint32_t bound = 0;
@@ -3013,6 +3859,23 @@ int main(void)
                 if (fmodf(R.race_t, 3.0f) < dt) ci.jump = 1;
                 if (fmodf(R.race_t + 2.55f, 3.0f) < dt) wings_pressed = 1;
             }
+#ifdef NR_PC
+            if (racing && getenv("CAMSTICK")) {           /* (the test machine: the right stick moved by a pattern, as the Vita reads it) */
+                float t = R.race_t - (float)atof(getenv("CAMSTICK")), sx = 0, sy = 0;
+                if (t >= 0) {
+                    float u = fmodf(t, 14.0f);
+                    if (u < 1.5f) sx = fminf(1, u / 0.3f); else if (u < 2.5f) sx = 0; else if (u < 4) sx = -0.5f; else if (u < 5) sx = 0;
+                    else if (u < 6) sy = -1; else if (u < 7) sy = 0; else if (u < 8) sy = 0.7f; else if (u < 9) sy = 0;
+                    else if (u < 12) { sx = 0.8f * cosf(3.14159f * (u - 9)); sy = 0.8f * sinf(3.14159f * (u - 9)); }
+                }
+                static uint32_t lcg = 12345;               /* the stick's own wobble: a step of 1 either way */
+                int qx = (int)lroundf(sx * 128 + 128), qy = (int)lroundf(sy * 128 + 128);
+                lcg = lcg * 1103515245u + 12345u; qx += (int)((lcg >> 16) % 3) - 1;
+                lcg = lcg * 1103515245u + 12345u; qy += (int)((lcg >> 16) % 3) - 1;
+                qx = qx < 0 ? 0 : qx > 255 ? 255 : qx; qy = qy < 0 ? 0 : qy > 255 ? 255 : qy;
+                cam_stick((qx - 128) / 128.0f, (qy - 128) / 128.0f, &cam_tx, &cam_ty);
+            }
+#endif
             /* CarRollMode (0x70907c): the trick stick moved, or the Advanced scheme's Roll button held */
             R.roll_mode = racing && (roll_held || fabsf(ci.roll_x) > 0.01f || fabsf(ci.roll_y) > 0.01f);
             /* the wings (0x708e70 / 0x706880): toggled, not more often than every 0.3 s; only in the
@@ -3035,6 +3898,7 @@ int main(void)
             ci.wings = R.wings;
             if (R.heat >= HEAT_MAX * 0.999f && !infinite_heat) ci.boost = 0;
 
+            LPMARK(LP_INPUT);
             /* the level's objects: their logic, then their collision near the car */
             memset(&R.hit, 0, sizeof R.hit);
             if (R.rs != RS_PAUSE) {
@@ -3078,7 +3942,13 @@ int main(void)
 #endif
                     for (int k = 0; k < 3; k++) R.car.vel[k] = (R.car.vel[k] + of.car_dv[k]) * of.car_vscale;
                 }
-                nr_objs_collision(&OBJS, R.car.pos, 8.0f + nr_car_speed(&R.car) * 0.1f);
+                {   /* the moving triangles the car's physics can touch this frame (its near boxes: nr_car's gather_near, 3.5 plus
+                     * the speed's 0.05 s, and where the frame takes it) at once; the rest of the reach only if a longer query
+                     * wants it (the Evil Carwash: 10000 triangles of spinning crushers, 2000 of them near) */
+                    float sp = nr_car_speed(&R.car);
+                    nr_objs_collision2(&OBJS, R.car.pos, 4.5f + sp * (fmaxf(dt, 0.05f) + dt), 8.0f + sp * 0.1f);
+                }
+                if (COLL.ndyn > win_dyn) win_dyn = COLL.ndyn;
 #ifdef NR_PC
                 if (haz_on && R.rs == RS_RACE) haz_frame();
                 if (R.rs == RS_RACE && getenv("SHOTRT")) {     /* (pictures at these race times) */
@@ -3091,8 +3961,35 @@ int main(void)
                     }
                     last_rt = R.race_t;
                 }
+                if (R.rs == RS_RACE && getenv("WRECKAT") && R.race_t >= (float)atof(getenv("WRECKAT"))) {   /* (a wreck at this race time) */
+                    static const void *done; if (done != R.lv) { done = R.lv; nrpc_wreck = 1; }   /* (once a level) */
+                }
+                if (R.rs == RS_FINISH && getenv("FRAGFIN")) {    /* (the same at these times into the finish: R.t) */
+                    static float last_fin = -1; const char *q = getenv("FRAGFIN");
+                    while (*q) { float ts = (float)atof(q); if (last_fin < ts && R.t >= ts) { gfx_fd_on = 1; fprintf(stderr, "FRAGS %s finish +%.2f s\n", R.lv->xml, R.t); }
+                                 q = strchr(q, ','); if (!q) break; q++; }
+                    last_fin = R.t;
+                }
+                if ((R.rs == RS_RACE || R.rs == RS_DEAD) && getenv("FRAGAT")) {     /* (the pixels each draw shades, at these race times) */
+                    static float last_ft = -1;
+                    const char *q = getenv("FRAGAT");
+                    while (*q) {
+                        float ts = (float)atof(q);
+                        if (last_ft < ts && R.race_t >= ts) { gfx_fd_on = 1; fprintf(stderr, "FRAGS %s at %.2f s\n", R.lv->xml, R.race_t);
+                            extern void particles_stat(int, const float *, float, void (*)(const char *));
+                            float fy = 2.0f * atanf(tanf((R.fov > 1 ? R.fov : 60) * 3.14159265f / 360.0f) / sqrtf(960.0f / 544.0f));
+                            float ev[3] = { CAM.pos.x, CAM.pos.y, CAM.pos.z };
+                            for (int pr = 0; pr < 3; pr++) particles_stat(pr, ev, 272.0f / tanf(fy * 0.5f), pstat_out); }
+                        q = strchr(q, ','); if (!q) break; q++;
+                    }
+                    last_ft = R.race_t;
+                }
 #endif
             }
+            LPMARK(LP_OBJECTS);
+#ifdef NR_PC
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); extern uint64_t phys_mark_us; phys_mark_us = ts.tv_sec * 1000000ull + ts.tv_nsec / 1000; }
+#endif
 
             if (R.rs != RS_PAUSE && R.rs != RS_DEAD && !(pilot_on && R.rs == RS_RACE)) {
                 float pre_v[3], pre_w[3]; memcpy(pre_v, R.car.vel, 12); memcpy(pre_w, R.car.angvel, 12);
@@ -3111,6 +4008,7 @@ int main(void)
                 R.phys_acc += dt;
                 int steps = 0;
                 while (R.phys_acc >= NR_CAR_DT && steps < 12) {
+                    memcpy(R.prev_pos, R.car.pos, 12); memcpy(R.prev_rot, R.car.rot, 36);
                     nr_car_step(&R.car, &carp, &COLL, NR_CAR_DT);
                     if (racing && autoplay && !chase_on && !pilot_coast
 #ifdef NR_PC
@@ -3124,6 +4022,7 @@ int main(void)
                     R.phys_acc -= NR_CAR_DT; steps++;
                 }
                 if (steps == 12) R.phys_acc = 0;
+                if (steps) R.interp = steps < 12;
                 /* CarLogic's collision rules (0x709290) over this frame's contacts */
                 if (objs_on && racing) {
                     nr_objs_car_contacts(&OBJS, &R.car, R.wings, &R.hit);
@@ -3132,13 +4031,73 @@ int main(void)
                     if (R.hit.fold_wings && R.wings) { R.wings = 0; snd_post("Play_WingIn", OBJ_CAR); layer_event("Wings_Off"); }
                 }
                 phys_us += (float)(sceKernelGetProcessTimeWide() - pt0);
+            } else if (R.rs != RS_PAUSE) R.interp = 0;     /* (dead, or the replay drives: the car is drawn where it is) */
+            if (pilot_on && R.rs == RS_RACE && autoplay && dt > 0) {
+                /* (autoplay along a replay: the car's physics still run each frame, on a copy put where the replay has
+                 * the car, so the test measures their cost - the Evil Carwash's crushers - though the replay drives) */
+                static nr_car SH; static float sh_acc;
+                uint64_t pt0 = sceKernelGetProcessTimeWide();
+                float v[3]; memcpy(v, R.car.vel, 12);
+                SH = R.car;
+                nr_car_reset_rot(&SH, R.car.pos, (const float (*)[3])R.car.rot); memcpy(SH.vel, v, 12);
+                nr_car_input z; memset(&z, 0, sizeof z); z.throttle = 1; z.wings = R.wings;
+                nr_car_frame(&SH, &carp, &COLL, &z, dt);
+                sh_acc += dt;
+                for (int steps = 0; sh_acc >= NR_CAR_DT && steps < 12; steps++) { nr_car_step(&SH, &carp, &COLL, NR_CAR_DT); sh_acc -= NR_CAR_DT; }
+                if (sh_acc >= NR_CAR_DT) sh_acc = 0;
+                phys_us += (float)(sceKernelGetProcessTimeWide() - pt0);
             }
+            LPMARK(LP_PHYSICS);
+#ifdef NR_PC
+            if (getenv("PHYSTOP")) {   /* (the test machine: the car's physics' slowest frames, wall clock, logged at 30 s of race time) */
+                static float top_ms[12], top_t[12]; static int logged_top;
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                static uint64_t mark; uint64_t nowm = ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+                extern uint64_t phys_mark_us; float ms = phys_mark_us ? (nowm - phys_mark_us) / 1000.0f : 0; (void)mark;
+                int k = 11; if (ms > top_ms[11]) { while (k > 0 && ms > top_ms[k - 1]) { top_ms[k] = top_ms[k - 1]; top_t[k] = top_t[k - 1]; k--; } top_ms[k] = ms; top_t[k] = R.race_t; }
+                if (!logged_top && R.race_t > (getenv("PHYSTOP_T") ? atof(getenv("PHYSTOP_T")) : 30)) { logged_top = 1;
+                    for (int i = 0; i < 12; i++) logm("PHYSTOP %.3f ms at %.2f s", top_ms[i], top_t[i]); }
+            }
+#endif
+#ifdef NR_PC
+            if (getenv("STATEHASH") && (R.rs == RS_RACE || R.rs == RS_DEAD)) {   /* (the car's state, to compare builds) */
+                static uint64_t sh_h = 1469598103934665603ull; static int sh_n; static const void *sh_lv;
+                if (sh_lv != (const void *)R.lv) { sh_lv = R.lv; sh_h = 1469598103934665603ull; sh_n = 0; }
+                const unsigned char *pp[4] = { (const unsigned char *)R.car.pos, (const unsigned char *)R.car.vel, (const unsigned char *)R.car.angvel, (const unsigned char *)R.car.rot };
+                const int pl[4] = { 12, 12, 12, 36 };
+                for (int k = 0; k < 4; k++) for (int j = 0; j < pl[k]; j++) { sh_h ^= pp[k][j]; sh_h *= 1099511628211ull; }
+                static int sh_every = -1; if (sh_every < 0) sh_every = atoi(getenv("STATEHASH")) > 1 ? 1 : 30;
+                if (++sh_n % sh_every == 0) logm("STATEHASH %s %.2f %016llx pos %.3f %.3f %.3f", R.lv->xml, R.race_t, (unsigned long long)sh_h, R.car.pos[0], R.car.pos[1], R.car.pos[2]);
+            }
+            if (getenv("OBJHASH") && (R.rs == RS_RACE || R.rs == RS_DEAD)) {   /* (the moving objects' state, to find where two runs part) */
+                static int oh_n; uint64_t h = 1469598103934665603ull;
+#define OH(p_, n_) for (size_t j_ = 0; j_ < (size_t)(n_); j_++) { h ^= ((const unsigned char *)(p_))[j_]; h *= 1099511628211ull; }
+                OH(&OBJS.rng, sizeof OBJS.rng)
+                float at = (float)atof(getenv("OBJHASH"));
+                for (int i = 0; i < OBJS.n; i++) {
+                    const nr_obj *o = &OBJS.o[i]; uint64_t h0 = h;
+                    OH(&o->kind, 4) OH(o->pos, 12) OH(o->R, 36) OH(o->vel, 12) OH(o->col, 16) OH(&o->t, 4) OH(o->f, 96) OH(o->s, 32)
+                    if (at > 0 && R.race_t >= at && R.race_t < at + 0.02f) logm("OBJHASH1 %d kind %d alive %d %016llx pos %.4f %.4f %.4f t %.4f s %d %d %d", i, o->kind, o->alive,
+                                                                               (unsigned long long)(h ^ h0), o->pos[0], o->pos[1], o->pos[2], o->t, o->s[0], o->s[1], o->s[2]);
+                }
+#undef OH
+                if (++oh_n % 30 == 0) logm("OBJHASH %.2f %016llx (%d objects)", R.race_t, (unsigned long long)h, OBJS.n);
+            }
+#endif
+#ifdef CSTAT
+            if (getenv("CSTAT") && R.rs == RS_RACE) {
+                logm("CSTAT %.2f at %.1f %.1f %.1f sph %u/%u/%u ray %u/%u/%u xf1 %u/%u xf2 %u/%u more %u full r%u s%u c%u gat %u (%u seen, %u kept) ndyn %u | us gather %u (dense cells %u, %u entries) queries %u focus %u (%u made, %u queries outside)", R.race_t, R.car.pos[0], R.car.pos[1], R.car.pos[2], NRCS.q_sph, NRCS.c_sph, NRCS.b_sph,
+                     NRCS.q_ray, NRCS.c_ray, NRCS.b_ray, NRCS.add1, NRCS.xf1, NRCS.add2, NRCS.xf2, NRCS.more, NRCS.qf_ray, NRCS.qf_sph, NRCS.cf, NRCS.gat, NRCS.gv, NRCS.gk, COLL.ndyn, NRCS.tg / 1000, NRCS.ts / 1000, NRCS.sn, NRCS.tq / 1000, NRCS.tb / 1000, NRCS.gcell, NRCS.nn);
+                memset(&NRCS, 0, sizeof NRCS);
+            }
+#endif
             if (R.rs != RS_PAUSE) { update_gibs(dt); if (R.cool_t > 0) R.cool_t -= dt; tutorial_update(dt); }
             if (R.rs != RS_PAUSE) trk_update(dt, R.rs == RS_RACE);   /* the tyre tracks (CarLogic 0x7065d0) */
 #ifdef NR_PC
             if (getenv("POSDBG") && R.race_t > atof(getenv("POSDBG")) && (R.frame % 3) == 0)
                 logm("    pos %.2f s: %.1f %.1f %.1f vel %.1f %.1f %.1f wheels %d rs %d pilot %d", R.race_t, R.car.pos[0], R.car.pos[1], R.car.pos[2], R.car.vel[0], R.car.vel[1], R.car.vel[2], R.car.grounded, R.rs, pilot_on);
 #endif
+            LPMARK(LP_TRACKS);
             /* the ReplayManager (0x6ff320): this frame's poses, then its 0.06 s ticks (paused: held) */
             if (R.rec_car >= 0 && R.rs != RS_DEAD) {
                 if (R.wings != R.rec_wings) { gh_rec_wings(R.rec_car, R.wings); R.rec_wings = R.wings; }
@@ -3149,6 +4108,7 @@ int main(void)
                 float gp[3] = { GIBS[i].pos.x, GIBS[i].pos.y, GIBS[i].pos.z };
                 gh_rec_pose(R.rec_gib[i], GIBS[i].rot, gp);
             }
+            gh_player_done = R.rs == RS_FINISH || (R.rs == RS_PAUSE && R.rs_before_pause == RS_FINISH);
             gh_update(R.rs == RS_PAUSE ? 0 : dt);
             if (pilot_on && (R.rs == RS_RACE || R.rs == RS_DEAD) && dt > 0) pilot_drive(dt);
 #ifdef NR_PC
@@ -3173,12 +4133,28 @@ int main(void)
                 }
             }
 
+            LPMARK(LP_GHOSTS);
+            /* the car as drawn, and as the camera follows it: between its last two physics steps (car_view) */
+            static nr_car VC;
+            VC = R.car; car_view(VC.pos, VC.rot);
+            const v3 vpos = v3make(VC.pos[0], VC.pos[1], VC.pos[2]);
+            const v3 vfw = v3make(VC.rot[0][1], VC.rot[1][1], VC.rot[2][1]), vup = v3make(VC.rot[0][2], VC.rot[1][2], VC.rot[2][2]);
+            const v3 vrt = v3make(VC.rot[0][0], VC.rot[1][0], VC.rot[2][0]);
+#ifdef NR_PC
+            if (getenv("VIEWLOG") && R.rs == RS_RACE) {     /* (the car and its drawn pose every frame: car_view's evenness) */
+                static FILE *vl; if (!vl) vl = fopen(getenv("VIEWLOG"), "w");
+                if (vl) fprintf(vl, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", R.race_t, dt, R.car.pos[0], R.car.pos[1], R.car.pos[2], VC.pos[0], VC.pos[1], VC.pos[2]);
+            }
+#endif
             /* ---- heat, boost, jets, the car's sounds */
             v3 cpos = v3make(R.car.pos[0], R.car.pos[1], R.car.pos[2]);
             v3 cfw = v3make(R.car.rot[0][1], R.car.rot[1][1], R.car.rot[2][1]);
-            v3 cup = v3make(R.car.rot[0][2], R.car.rot[1][2], R.car.rot[2][2]);
             v3 crt = v3make(R.car.rot[0][0], R.car.rot[1][0], R.car.rot[2][0]);
             float spd = nr_car_speed(&R.car), vf = nr_car_forward_speed(&R.car);
+            if (R.rs != RS_PAUSE) {
+                wing_amt = fminf(1, fmaxf(0, wing_amt + (R.wings ? 3.0f : -3.0f) * dt));
+                jet_thr = fminf(1, fmaxf(0, jet_thr + (R.boosting ? 2.0f : -2.0f) * dt));
+            }
             if (R.rs == RS_RACE) {
                 int boost = ci.boost || R.wings;          /* CarLogic: the jets run whenever the wings are out */
                 if (boost != R.boosting) {
@@ -3229,6 +4205,9 @@ int main(void)
                 /* impacts, as CarLogic judges them: a crash kills above 60 (20 with the wings out, the
                  * saws' own Death Speed) unless the car lands on its wheels; deadly surfaces kill at once */
                 if (pilot_on) R.hit.death = 0;               /* (the test drive crashes where its replay does) */
+#ifdef NR_PC
+                if (getenv("NODEATH")) R.hit.death = 0;      /* (the test machine: a roof slide, not a wreck) */
+#endif
                 if (R.hit.death == 2) explode("deadly surface", 2);
                 else if (R.hit.death == 3) {
                     logm("  crash at %.1f %.1f %.1f, surface normal %.2f %.2f %.2f, speed %.0f, wings %d, wheels down %d", R.hit.death_p[0], R.hit.death_p[1], R.hit.death_p[2],
@@ -3239,6 +4218,21 @@ int main(void)
                 else if (R.hit.crash_sound == 1) snd_post("Play_Rand_SmallCrash", OBJ_CAR);
                 if (R.hit.shake > 0.003f && R.hit.shake > R.shake_amp * expf(-6.0f * R.shake_t)) { R.shake_amp = R.hit.shake; R.shake_t = 0; }
                 int scraping = R.hit.scraping;
+                {   /* (a test: SNDFLICKER=scrape|skid|crash[,every] on the test machine, the switch file snd_flicker with that in it
+                     * on the Vita - from 5 to 10 s of race time, the sound toggled or posted every N frames, as a car grazing
+                     * a wall would) */
+                    const char *fl = snd_flicker[0] ? snd_flicker : NULL;
+#ifdef NR_PC
+                    if (getenv("SNDFLICKER")) fl = getenv("SNDFLICKER");
+#endif
+                    if (fl && R.race_t >= 5 && R.race_t < 10) {
+                        const char *c = strchr(fl, ','); int ev = c ? atoi(c + 1) : 1; if (ev < 1) ev = 1;
+                        int on = (R.frame / ev) & 1;
+                        if (!strncmp(fl, "scrape", 6)) scraping = on;
+                        else if (!strncmp(fl, "crash", 5) && R.frame % ev == 0) snd_post("Play_Rand_SmallCrash", OBJ_CAR);
+                        else if (!strncmp(fl, "skid", 4)) { if (on != R.skid) { snd_post(on ? "Play_Rand_TireSkid" : "Stop_Rand_TireSkid", OBJ_CAR); R.skid = on; } }
+                    }
+                }
                 if (scraping != R.scrape) { snd_post(scraping ? "Play_Rand_Scrape" : "Stop_Rand_Scrape", OBJ_CAR); R.scrape = scraping; }
                 /* tyre skid: sideways sliding on the ground */
                 v3 vel = v3make(R.car.vel[0], R.car.vel[1], R.car.vel[2]);
@@ -3313,10 +4307,24 @@ int main(void)
                 float st = R.rs == RS_RACE ? (spd - 100.0f) / 50.0f : 0; st = st < 0 ? 0 : st > 1 ? 1 : st;
                 snd_set_obj_param(OBJ_SPARK, "CMD_Volume", st);
             }
+#ifdef NR_PC
+            if (getenv("ENGINECHECK") && R.rs == RS_RACE && R.alive_t > 1.0f) {   /* (the test machine: is the engine heard? A level's
+                                                                                 * silences of a second or more; not just after a respawn) */
+                static float next_t = 0; static const void *lvp; static int run;
+                if (lvp != R.lv || R.race_t < next_t - 1) { lvp = R.lv; next_t = 0; run = 0; }
+                if (R.race_t >= next_t) {
+                    next_t = R.race_t + 0.5f;
+                    float db; int n = snd_obj_voices(OBJ_CAR, &db);
+                    if (n == 0 || db < -30) { if (++run == 3) logm("ENGINE silent %s from race %.1f: %d looping voices on the car, loudest %.1f dB", R.lv->xml, R.race_t - 1.0f, n, db); }
+                    else run = 0;
+                }
+            }
+#endif
             update_emitters(cpos);
             if (objs_on) update_obj_sounds(cpos);
             if (R.rs != RS_PAUSE) shock_update(dt, R.rs == RS_RACE);
 
+            LPMARK(LP_CARSND);
             /* ---- checkpoints and finish */
             /* the race clock (BaseLevel +0x48) runs on while the car is wrecked: a crash costs its 2 s (the
              * shipped replays' lengths match their times only so); the stunt clock as well (re_I 4) */
@@ -3403,13 +4411,17 @@ int main(void)
                     fin = 0;
                 }
                 if (fin) {
+                    uint64_t q0 = prof_us();
                     R.rs = RS_FINISH; R.t = 0; R.done_time = R.race_t; R.result_sel = 0;
                     warp_out_portal();                       /* the car leaves for the end tunnel's portal */
+                    uint64_t q1 = prof_us();
                     car_sounds_off();
                     snd_post("Play_WarpOut", 0);                /* CarFinish 0x705da0: the car leaves for its stand-in */
                     ann_queue("Play_Finish");
                     save_level *sl = save_level_get(&SAVE, R.lv->xml, 1);
+                    uint64_t q2 = prof_us();
                     run_finished(R.race_t, 1);
+                    uint64_t q3 = prof_us();
                     R.new_best = sl && (sl->best <= 0 || R.race_t < sl->best);
                     if (sl) { if (R.new_best) sl->best = R.race_t; sl->done = 1; sl->unlocked = 1; }
                     if (R.new_best && sl && sl->best != R.race_t) {}
@@ -3422,12 +4434,20 @@ int main(void)
                     if (R.lv->sd == 2) { ann_queue("Play_TutorialComplete"); ach_unlock("Initiate"); }
                     else if (R.lv->score && R.lv->score != 6 && !R.wrecks) ach_unlock("Still Alive");
                     if (R.score > SAVE.best_score) SAVE.best_score = R.score;
+                    uint64_t q4 = prof_us();
                     save_write(&SAVE, SAVE_PATH);
+                    uint64_t q5 = prof_us();
                     logm("RESULT %s finished in %.2f s, checkpoints %d/%d, wrecks %d%s", R.lv->xml, R.race_t, R.cp_count, G.ncp, R.wrecks, chase_on ? ", physics drive" : ""); fx_log();
+#ifdef NR_PC
+                    logm("  (finish frame: warp-out %.2f ms, sounds+save %.2f, run %.2f, unlocks %.2f, save %.2f)", (q1 - q0) / 1000.0f, (q2 - q1) / 1000.0f, (q3 - q2) / 1000.0f, (q4 - q3) / 1000.0f, (q5 - q4) / 1000.0f);
+#else
+                    (void)q0; (void)q1; (void)q2; (void)q3; (void)q4; (void)q5;
+#endif
                     if (chase_on) logm("CHASE %s assists %d resyncs %d replay %.1f s", R.lv->xml, CH.assists, CH.resyncs, ch_length(&CH));
                 }
             }
 
+            LPMARK(LP_CHECKPTS);
             /* ---- leaving the race */
             if (restart) { car_sounds_off(); start_race(); }
             if (next && R.story && R.lv && R.lv->sd == 2 && !autoplay) {   /* TutorialLevel 0x70d920: in Story mode, the intro */
@@ -3454,9 +4474,9 @@ int main(void)
                 go_menu = 2;
             }
             if (go_menu) {
-                if (autoplay) auto_level++;                  /* (a tutorial's own end: on to the next level) */
+                if (autoplay) { lvperf_end(); auto_level++; }   /* (a tutorial's own end: on to the next level) */
                 car_sounds_off(); stop_emitters(); level_sounds_exit();
-                snd_post("Stop_CarEngine", OBJ_CAR);
+                engine_stop();
                 front_menu_level();
                 mode = MODE_FRONT;
                 front_enter(go_menu == 2 && !R.story ? FE_LEVELS : FE_MAIN);
@@ -3465,9 +4485,10 @@ int main(void)
                 continue;
             }
 
+            LPMARK(LP_LEAVE);
             /* ---- camera */
             float M[4][4];
-            float Mi[4][4] = { { crt.x, cfw.x, cup.x, cpos.x }, { crt.y, cfw.y, cup.y, cpos.y }, { crt.z, cfw.z, cup.z, cpos.z }, { 0, 0, 0, 1 } };
+            float Mi[4][4] = { { vrt.x, vfw.x, vup.x, vpos.x }, { vrt.y, vfw.y, vup.y, vpos.y }, { vrt.z, vfw.z, vup.z, vpos.z }, { 0, 0, 0, 1 } };
             memcpy(M, Mi, sizeof M);
             if (R.rs == RS_DEAD) {                    /* the death camera: stays, follows the pieces */
                 v3 Mc = R.boom; float spread = 0;
@@ -3481,15 +4502,26 @@ int main(void)
                 }
                 cam_track(&CAM, Mc, spread, dt);
             } else if (R.rs == RS_FINISH) {                 /* the finish camera (mode 6): stays, follows the car */
-                cam_track(&CAM, cpos, 0, dt);
+                cam_track(&CAM, vpos, 0, dt);
             } else if (R.rs == RS_COUNT && WARPM.nch) {     /* the countdown's: round the stand-in (0x712dc3) */
                 cam_intro(&CAM, cpos, R.car.rot, R.cd, &COLL);
-            } else if (R.rs != RS_PAUSE) cam_chase_step(&CAM, &R.car, &COLL, dt, R.wings ? ci.pitch : 0, part_tmax[0] > 0 ? part_t[0] / part_tmax[0] : (float)R.wings, R.credits, cam_tx, cam_ty);
+            } else if (R.rs != RS_PAUSE) cam_chase_step(&CAM, &VC, &COLL, dt, R.wings ? ci.pitch : 0, part_tmax[0] > 0 ? part_t[0] / part_tmax[0] : (float)R.wings, R.credits, cam_tx, cam_ty);
+#ifdef NR_PC
+            cam_tx_log = cam_tx; cam_ty_log = cam_ty;
+#endif
             if (CAM.fade < 1) CAM.fade = fminf(1, CAM.fade + 3.0f * dt);          /* Fade Speed 3: from black */
             if (R.rs == RS_COUNT) CAM.fade = fminf(CAM.fade, fminf(1, fmaxf(0, R.cd - CD_T0)));   /* the countdown's: over its first second */
             v3 eye = CAM.pos, fwd = mul(CAM.z, -1), upv = CAM.y;
-            if (R.rs == RS_FINISH) {
-                frc_update(dt);
+#ifdef NR_PC
+            if (getenv("CAMLOG") && (R.rs == RS_RACE || R.rs == RS_DEAD)) {   /* (the test machine: the camera every frame, docs/testing.md) */
+                static FILE *cl; if (!cl) cl = fopen(getenv("CAMLOG"), "w");
+                if (cl) fprintf(cl, "%.4f,%.4f,%d,%.3f,%.3f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.3f,%.3f\n", R.t, R.race_t, R.wings,
+                                 CAM.W, CAM.T, eye.x, eye.y, eye.z, fwd.x, fwd.y, fwd.z, upv.x, upv.y, upv.z, R.car.pos[0], R.car.pos[1], R.car.pos[2], cam_tx_log, cam_ty_log),
+                        fprintf(cl, "B,%.5f,%.5f,%.5f,%.4f,%.4f,%.3f,%.3f\n", -CAM.bz.x, -CAM.bz.y, -CAM.bz.z, CAM.lyaw, CAM.lpitch, CAM.ldist, (float)R.car.grounded);
+            }
+#endif
+            if (R.rs == RS_FINISH || (bench_mode >= 0 && bench_fin)) {
+                if (R.rs == RS_FINISH) frc_update(dt);
                 if (frc_active()) {
                     eye = FRC.pos; fwd = norm(sub(FRC.look, FRC.pos));
                     v3 rr = cross(fwd, v3make(0, 0, 1)); if (len(rr) < 1e-3f) rr = v3make(1, 0, 0);
@@ -3512,6 +4544,7 @@ int main(void)
             float lis[3] = { eye.x, eye.y, eye.z }, lf[3] = { fwd.x, fwd.y, fwd.z }, lu[3] = { upv.x, upv.y, upv.z };
             snd_set_listener(lis, lf, lu);
 
+            LPMARK(LP_CAMERA);
             /* ---- draw */
             static gfx_obj objs[MAX_DRAWOBJ]; int nobj = 0; memset(objs, 0, sizeof objs);
             gfx_sprite spr[24]; int nspr = 0;
@@ -3526,6 +4559,14 @@ int main(void)
                 }
                 else { objs[nobj].model = &CAR; memcpy(objs[nobj].m, M, sizeof M); nobj++; }   /* (drawn in the bumper view too, as the PC) */
             }
+            if (particles_ok && R.rs != RS_PAUSE) particles_update(dt);     /* (the particles' clock first, as the PC) */
+            {
+                float fy = 2.0f * atanf(tanf((R.fov > 1 ? R.fov : 60) * 3.14159265f / 360.0f) / sqrtf(960.0f / 544.0f));
+                float ev[3] = { eye.x, eye.y, eye.z };
+                if (particles_ok) particles_view(ev, 272.0f / tanf(fy * 0.5f));
+                gh_view(ev, 272.0f / tanf(fy * 0.5f));
+            }
+            DSMARK(0);
             /* moving parts: wings out while flying, boosters out while boosting, jets with the jets */
             {
                 float tgt[3] = { R.wings ? part_tmax[0] : 0, R.boosting ? part_tmax[1] : 0, R.jets ? part_tmax[2] : 0 };
@@ -3541,11 +4582,19 @@ int main(void)
 #ifdef NR_PC
                 wing_force = getenv("WINGFORCE") != NULL;      /* (the test machine: the wing tips trail on the ground too) */
 #endif
-                if (particles_ok && R.rs == RS_RACE && (wing_force || (R.wings && part_tmax[0] > 0 && part_t[0] >= 0.9f * part_tmax[0]))) {
+                /* CarLogic 0x706ed7 sets the wing tips' Spawn Frequency every frame: half the speed squared, at most 2000 a
+                 * second, while the wings are 90% out (scaled by how far out they are from 10%), else none - not the
+                 * blueprint's 160 */
+                float vv = R.car.vel[0] * R.car.vel[0] + R.car.vel[1] * R.car.vel[1] + R.car.vel[2] * R.car.vel[2];
+                float wrate = fminf(0.5f * vv, 2000.0f);
+                wrate = wing_amt > 0.9f ? wrate : wing_amt > 0.1f ? wrate * wing_amt : 0;
+                if (wing_force) wrate = fmaxf(wrate, 160);
+                if (particles_ok && R.rs == RS_RACE && wrate > 0) {
 #ifdef NR_PC
-                    if (getenv("TRKLOG") && nce && !CE[0].st.primed) logm("  wing tips: trailing (%d emitters, %d particles)", nce, particles_count());
+                    if (getenv("TRKLOG") && nce && !CE[0].st.primed) logm("  wing tips: trailing (%d emitters, %d particles, %.0f a second each)", nce, particles_count(), wrate);
 #endif
                     for (int i = 0; i < nce; i++) {
+                        CE[i].e.freq = wrate;
                         float M3[3][4]; for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) M3[r][c] = PW[CE[i].part][r][c];
                         unsigned m0 = particles_made;
                         particles_emit(&CE[i].e, &CE[i].st, M3, dt, 1.0f);
@@ -3554,9 +4603,33 @@ int main(void)
                             snprintf(test_shot_req, sizeof test_shot_req, "%s_wings", R.lv->xml);   /* (the first 120) */
                     }
                 } else if (R.rs != RS_PAUSE) emitters_reset();
+#ifdef NR_PC
+                if (getenv("PARTLOG") && R.rs == RS_RACE) { extern int particles_alive(int);
+                    int a0 = particles_alive(0), a1 = particles_alive(1), a2 = particles_alive(2);
+                    extern unsigned particles_head(int);
+                    logm("PART t %.3f wings %d amt %.2f thr %.2f n %d wing %u dt %.4f | alive/window short %d/%d long %d/%d dark %d/%d | heads %u %u %u", R.race_t, R.wings, wing_amt, jet_thr, particles_count(), fx_wing, dt,
+                         a0 / 100000, a0 % 100000, a1 / 100000, a1 % 100000, a2 / 100000, a2 % 100000, particles_head(0), particles_head(1), particles_head(2)); }
+#endif
+                /* CarLogic 0x703f32: k = (jets - 0.5) x 2 drives the boosters' look and the car's exhaust: the part named
+                 * CarBoosters (the Interceptor's) is coloured (1, 0.95, 0.95) glowing 2k, and its light 1.5k; the car's own
+                 * ParticleEmitter (Car / Van / Cycle / Car_Gold .xml, all alike) makes 800k fire particles a second */
+                float jk = fmaxf(0, (jet_thr - 0.5f) * 2.0f);
+                int interceptor = SAVE.vehicle >= 0 && SAVE.vehicle < FE_NVEH && !strcmp(FE_VEH[SAVE.vehicle].key, "interceptor");
                 for (int i = 0; i < ncp && nobj < MAX_DRAWOBJ; i++) if (CP[i].model >= 0) {
-                    objs[nobj].model = &CPM[CP[i].model]; memcpy(objs[nobj].m, PW[i], sizeof PW[i]); nobj++;
+                    objs[nobj].model = &CPM[CP[i].model]; memcpy(objs[nobj].m, PW[i], sizeof PW[i]);
+                    if (i == booster_part && interceptor) {
+                        objs[nobj].use_col = 1; objs[nobj].col[0] = 1.0f; objs[nobj].col[1] = objs[nobj].col[2] = 242 / 255.0f;
+                        objs[nobj].col[3] = (int)(jk * 2.0f * 10.0f) * 0.1f;     /* (the glow byte, as RenderMesh keeps it) */
+                    }
+                    nobj++;
                 }
+                if (particles_ok && R.rs == RS_RACE && jk > 0 && SAVE.vehicle >= 0 && SAVE.vehicle < FE_NVEH && strcmp(FE_VEH[SAVE.vehicle].key, "commander")) {
+                    int raised = !strcmp(FE_VEH[SAVE.vehicle].key, "avenger") || strstr(FE_VEH[SAVE.vehicle].key, "cycle") != NULL;
+                    nr_pemit ex = { 7, 0, 0.3f, 13, 0, 0, 0.2f, 0, { 0, -1.3f, raised ? 0.3f : 0 }, { 0, 0.5f, 0 }, 0, 0, 0,
+                                    { 0, -1, 0 }, 4, 20, 10, 0, 0.05f, 800.0f * jk };
+                    float M3[3][4]; for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) M3[r][c] = M[r][c];
+                    particles_emit(&ex, &exh_st, M3, dt, 1.0f);
+                } else if (R.rs != RS_PAUSE) exh_st.primed = 0;
                 for (int i = 0; i < ncf && nobj < MAX_DRAWOBJ && FLAME.nch; i++) {
                     int g = CP[CF[i].part].group;
                     int on = (g == 1 && R.boosting && part_t[1] > 0.3f) || (g == 2 && R.jets && CP[CF[i].part].jet >= 0 && (R.jet_thrust >> CP[CF[i].part].jet & 1) && part_t[2] >= part_tmax[2] * 0.9f);
@@ -3567,18 +4640,25 @@ int main(void)
                     m4mul(objs[nobj].m, PW[CF[i].part], L); objs[nobj].model = &FLAME; nobj++;
                 }
             }
-            if (R.rs != RS_DEAD && R.boosting && nspr < 24) {
-                v3 bp = add(cpos, mul(cfw, -1.9f));
-                spr[nspr].pos = bp; spr[nspr].size = 2.2f; spr[nspr].r = 1.0f; spr[nspr].g = 0.45f; spr[nspr].b = 0.15f; spr[nspr].tex = 0; spr[nspr].angle = 0; nspr++;
+            /* (the boosters' Light, 0.8 0.5 0.1 at 1.5k, lights the road behind the car: a glow there while on the ground. In
+             * the air nothing is near to light, and the PC draws no halo: the footage's flying car shows none) */
+            if (R.rs != RS_DEAD && jet_thr > 0.5f && R.car.grounded && nspr < 24) {
+                float jk2 = fmaxf(0, (jet_thr - 0.5f) * 2.0f);
+                v3 bp = add(vpos, mul(vfw, -1.9f));
+                spr[nspr].pos = bp; spr[nspr].size = 2.2f; spr[nspr].r = 1.0f * jk2; spr[nspr].g = 0.45f * jk2; spr[nspr].b = 0.15f * jk2; spr[nspr].tex = 0; spr[nspr].angle = 0; nspr++;
             }
-            nobj = gh_draw(objs, nobj, MAX_DRAWOBJ);
+            DSMARK(1);
+            if (bench_mode != 4 && bench_mode != 13) nobj = gh_draw(objs, nobj, MAX_DRAWOBJ);   /* (bench: no ghost cars) */
+            DSMARK(2);
             /* the tunnels' portals (ChildObjectLogic's Portal of tunnel2 / EndTunnel2: traffic.fx, scrolling blue) */
             for (int i = 0; PORTALM.nch && R.lv && i < nportals && nobj < MAX_DRAWOBJ; i++) if (!strcmp(PORTALS[i].lv, R.lv->xml)) {
                 gfx_obj *g = &objs[nobj++]; memset(g, 0, sizeof *g); g->model = &PORTALM;
                 for (int r = 0; r < 3; r++) { for (int c = 0; c < 3; c++) g->m[r][c] = PORTALS[i].R[r][c] * PORTALS[i].s[c]; g->m[r][3] = PORTALS[i].p[r]; }
                 g->m[3][3] = 1;
             }
+            DSMARK(3);
             nobj = add_level_objects(objs, nobj, eye, fwd);
+            DSMARK(4);
             if (R.rs != RS_DEAD && !frc_active()) nobj = shock_draw(objs, nobj, MAX_DRAWOBJ, eye);
             /* sparks where the body scrapes (CarLogic's sparks emitter, rate = sliding speed / 3) */
             if (particles_ok && R.rs != RS_PAUSE) {
@@ -3593,8 +4673,9 @@ int main(void)
                     else if (on) { on = 0; logm("  scrape %.2f-%.2f s: rate up to %.1f, %d contacts, speed %.0f", t0, R.race_t, mx, nc, nr_car_speed(&R.car)); }
                 }
 #endif
+                DSMARK(5);
                 if (objs_on) run_emitters(eye, fwd, dt);
-                particles_update(dt);
+                DSMARK(6);
             } else if (R.hit.spark_rate >= 2.0f && R.rs == RS_RACE) {
                 v3 sp = v3make(R.hit.spark[0], R.hit.spark[1], R.hit.spark[2]);
                 for (int i = 0; i < 3 && nspr < 24; i++) {
@@ -3613,6 +4694,7 @@ int main(void)
             }
             if (R.boom_t > 0 && R.boom_t < 1.6f) {
                 float k = R.boom_t / 1.6f;
+                int s0 = nspr;
                 for (int i = 0; i < 10 && nspr < 24; i++) {
                     float a = i * 0.628f, rr = 1.5f + 9.0f * k * (0.6f + 0.4f * sinf(i * 1.7f));
                     spr[nspr].pos = add(R.boom, v3make(cosf(a) * rr * 0.6f, sinf(a) * rr * 0.6f, rr * 0.4f * sinf(i * 2.3f) + 1));
@@ -3621,32 +4703,51 @@ int main(void)
                     spr[nspr].r = 0.5f * (1 - k) * (1 - k); spr[nspr].g = 0.9f * (1 - k); spr[nspr].b = 1.6f * (1 - k);
                     spr[nspr].tex = 0; nspr++;
                 }
+                /* close to the camera the ten glows each fill most of the screen (seven screens' worth of pixels, which
+                 * took the GPU past the frame). Seen from there they are one glow: then they are drawn as one, round
+                 * the ones in front of the camera (on the screen: wide enough to take them all in; as near as the
+                 * nearest), with their light added up, so at most a screen's worth */
+                if (sprites_cover(spr + s0, nspr - s0, eye, fwd, upv, 1.0f) > 1.5f && !boom_full)
+                    nspr = s0 + sprites_merge(spr + s0, nspr - s0, eye, fwd, upv);
             }
+            DSMARK(7);
             trk_build(eye);
+            DSMARK(8);
             /* (SpeedFov: the same smoothed speed factor drives the FOV and the speed blur; credits: TurnOffBlur) */
             R.blur = R.credits || R.rs == RS_DEAD ? 0 : CAM.s;
             (void)spd;
             gfx_post post; memset(&post, 0, sizeof post);
             post.blur = SAVE.motion_blur ? R.blur : 0;      /* Options: Toggle Motion Blur */
-            dyn_res_step(dt, SAVE.dyn_res && bench_mode < 0);
+#ifdef NR_PC
+            if (getenv("BLURLOG") && R.rs == RS_RACE) { static int was; int on = post.blur > 0.01f; if (on != was) { logm("BLUR %s at %.2f s (%.3f)", on ? "on" : "off", R.race_t, post.blur); was = on; } }
+#endif
+            dyn_res_step(dt, SAVE.dyn_res && bench_mode < 0 && !(autoplay && nocap));   /* (nocap: what each frame really costs) */
             /* autoplay: what each part of the picture costs (BENCH lines in the log). On Campaign_Level1
              * and Campaign_Level5, 10 s in, the race holds still ("Measuring performance" on screen),
              * vsync goes off and the same view is drawn 70 frames in each of these ways */
             if (bench_mode >= 0) {
-                GSW.no_bloom = 0; GSW.no_wide = 0; GSW.no_post = bench_mode == 7;
+                GSW.no_bloom = bench_mode == 9; GSW.no_wide = 0; GSW.no_post = bench_mode == 7;
                 if (bench_mode == 8) post.blur = 0;
-                gfx_scene_scale = bench_mode == 6 ? 0.7f : 1.0f;
-                if (bench_mode == 1) nobj = R.rs != RS_DEAD && CAR.nch ? 1 : 0;         /* the car only */
-                if (bench_mode == 4 || bench_mode == 5) {                                /* one model left out */
-                    int k = 0;
-                    for (int i = 0; i < nobj; i++) if (!objs[i].model || !strstr(objs[i].model->name, bench_mode == 4 ? "AirMine" : "core_building")) objs[k++] = objs[i];
-                    nobj = k;
-                }
-                gfx_dbg = bench_mode == 2 ? 8 : bench_mode == 3 ? 16 : bench_mode == 9 ? 1 : bench_mode == 10 ? 4 : 0;
+                gfx_scene_scale = bench_mode == 6 ? 0.5f : 1.0f;
+                if (bench_mode == 1 || bench_mode == 13) nobj = R.rs != RS_DEAD && CAR.nch && bench_mode == 1 ? 1 : 0;   /* the car only / nothing */
+                bench_no_particles = bench_mode == 13 || bench_mode == BENCH_NOPART;
+                particles_skip = bench_mode >= BENCH_PSHORT && bench_mode < BENCH_PSHORT + 3 ? 1 << (bench_mode - BENCH_PSHORT) : sw_part_skip;
+                gh_no_merge = bench_mode == 5;
+                gh_max_draw = bench_mode == BENCH_GTWO ? 2 : 0;
+                {   static const int PD[9] = { 4, 32, 1, 512, 1024, 2048, 4096, 16384, 32768 };   /* (the particles' ways: gfx_part_dbg's) */
+                    gfx_part_dbg = sw_part_dbg | (bench_mode >= BENCH_PDBG && bench_mode < BENCH_PDBG + 9 ? PD[bench_mode - BENCH_PDBG] : 0); }
+                gfx_half_use(bench_mode == BENCH_HSCROLL ? GFX_HALF_SCROLL : bench_mode == BENCH_HSCROLLR ? GFX_HALF_SCROLL_READS : bench_mode == BENCH_HGLOW ? GFX_HALF_GLOW :
+                             bench_mode == BENCH_HFINAL ? GFX_HALF_FINAL : bench_mode == BENCH_HALL ? GFX_HALF_SCROLL | GFX_HALF_SCROLL_READS | GFX_HALF_GLOW | GFX_HALF_FINAL : 0);
+                GSW.no_lod = sw_no_lod || bench_mode == BENCH_NOLOD;
+                GSW.no_runs = sw_no_runs || bench_mode == BENCH_NORUNS;
+                gfx_dbg = bench_mode == 2 ? 8 : bench_mode == 3 ? 16 : bench_mode == 10 ? 64 : bench_mode == 11 ? 1 : bench_mode == 12 ? 4 :
+                          bench_mode == 13 ? 1 | 4 : bench_mode == BENCH_SCROLL1 ? 128 : bench_mode == BENCH_SCROLLBIL ? 256 : bench_mode == BENCH_ALLLIGHTS ? 512 :
+                          bench_mode == BENCH_GSOLID ? 2048 : bench_mode == BENCH_GCULL ? 4096 : 0;
+                if (!(gfx_dbg & 256)) gfx_bench_restore();
             }
             if (R.boom_t > 0 && R.boom_t < 0.25f) post.flash = 0.35f * (1 - R.boom_t / 0.25f);
             gfx_time = R.t;
-            uint64_t g0 = now_us();
+            uint64_t g0 = now_us(); lp_g0 = prof_us();
             T_logic += g0 - c0;
 #ifdef NR_PC
             if (getenv("OBJSTAT") && R.rs == RS_RACE && R.race_t > atof(getenv("OBJSTAT"))) {   /* (the test machine: the objects' triangles, once) */
@@ -3665,7 +4766,19 @@ int main(void)
                 }
             }
 #endif
+#ifdef NR_PC
+            int fe_draw = 0;
+            if (getenv("FRAGEVERY") && R.rs == RS_RACE) {   /* (the test machine: the pixel counts every N s of race time, one line each) */
+                static float next_fe = 0; static const void *fe_lv;
+                if (fe_lv != R.lv || R.race_t < next_fe - 1000) { fe_lv = R.lv; next_fe = 0; }
+                if (R.race_t >= next_fe) { next_fe = R.race_t + (float)atof(getenv("FRAGEVERY")); gfx_fd_on = 2; fe_draw = 1;
+                    snprintf(gfx_fd_where, sizeof gfx_fd_where, "%s %.1f", R.lv->xml, R.race_t); }
+            }
+            extern char shot_req[64];
+            if (!nodraw || fe_draw || gfx_fd_on || shot_req[0]) gfx_draw_frame(&L, eye, fwd, upv, R.fov, objs, nobj, spr, nspr, &post);   /* (NODRAW: these only) */
+#else
             if (!nodraw) gfx_draw_frame(&L, eye, fwd, upv, R.fov, objs, nobj, spr, nspr, &post);
+#endif
             uint64_t g1 = now_us();
             T_draw += g1 - g0;
             /* (no glFinish probe here any more: draining the GPU once a second made the autoplay stutter, and the
@@ -3675,19 +4788,20 @@ int main(void)
             hud_begin();
             if (CAM.fade < 1 && R.rs != RS_DEAD) hud_rect(0, 0, 960, 544, (unsigned)((1 - CAM.fade) * 255));   /* the camera's fade from black */
             if (frc_active() && FRC.fade < 1) hud_rect(0, 0, 960, 544, (unsigned)((1 - FRC.fade) * 255));
-            gh_draw_labels(R.rs == RS_PAUSE ? 0 : dt);
-            if (!(R.rs == RS_FINISH && (R.fin_stage >= 1 || !R.lv->score))) draw_race_hud();
-            if (bench_mode >= 0) hud_text(HUD_FONT_MAIN, 480, 70, 22, 0xFFFFFFC0, HUD_CENTER, "Measuring performance (automatic test only)");
+            if (bench_mode != BENCH_NOHUD) gh_draw_labels(R.rs == RS_PAUSE ? 0 : dt);
+            if (!(R.rs == RS_FINISH && (R.fin_stage >= 1 || !R.lv->score)) && bench_mode != BENCH_NOHUD) draw_race_hud();
+            /* (the bench holds the race paused; its "no HUD" way drew the pause menu here until 1.0.1-dev28: the dimmed screen made it the slowest way) */
+            if (bench_mode >= 0) { if (bench_mode != BENCH_NOHUD) hud_text(HUD_FONT_MAIN, 480, 70, 22, 0xFFFFFFC0, HUD_CENTER, "Measuring performance (automatic test only)"); }
             else if (R.rs == RS_PAUSE) pause_draw();
             if (R.credits && R.rs != RS_FINISH) cin_skip_draw();
             if (R.rs == RS_FINISH && R.credits) {
                 float k = R.t - 2.5f; k = k < 0 ? 0 : k > 1 ? 1 : k;
                 if (k > 0) hud_rect(0, 0, 960, 544, (unsigned)(k * 255));
             } else if (R.rs == RS_FINISH) { draw_finish(); if (R.fin_stage == 2 && PM.state == PM_DLG) ui_dlg_draw(&PM.d); }
-            ui_popup_update(dt);
+            ui_popup_update(bench_mode >= 0 ? 0 : dt);   /* (held in the bench: its pictures compared) */
             ui_popup_draw();
             hud_end();
-            } else ui_popup_update(dt);
+            } else ui_popup_update(bench_mode >= 0 ? 0 : dt);
             if (test_shots) {   /* (the warp-in during the countdown, the warp-out after the finish line) */
                 static float last_cd = 99, last_ft = 99;
                 if (test_spark_t >= 0 && R.rs == RS_RACE && R.race_t >= test_spark_t && !test_shot_req[0]) {
@@ -3700,20 +4814,80 @@ int main(void)
                     last_ft = R.t; } else last_ft = -1;
                 test_shot_take();
             }
+            bench_picture();
             uint64_t s0 = now_us();
             T_hud += s0 - g1;
-            vglSwapBuffers(GL_FALSE);
+            frame_swap();
             T_swap += now_us() - s0;
+            fr_logic = (g0 - c0) / 1000.0f; fr_draw = (s0 - g0) / 1000.0f; fr_swap = (now_us() - s0) / 1000.0f;
+#ifdef NR_PC
+            static float lp_min = -1; if (lp_min < 0) lp_min = getenv("SLOWLOGIC") ? (float)atof(getenv("SLOWLOGIC")) : 6.0f;
+#else
+            const float lp_min = 6.0f;
+#endif
+            float lp_ms = (lp_g0 - lp_c0) / 1000.0f;
+            if (mode == MODE_RACE && lp_ms > lp_min) {   /* a frame whose logic took long: where it went (at most twice a second) */
+                static uint64_t last_lp;
+#ifdef NR_PC
+                if (getenv("SLOWALL")) last_lp = 0;            /* (the test machine: every one) */
+#endif
+                if (s0 - last_lp > 500000) {
+                    last_lp = s0;
+                    char b[400]; int o = 0; uint64_t prev = lp_c0;
+                    for (int k = 0; k < LP_N; k++) {
+                        uint64_t t = LPT[k] >= prev && LPT[k] <= lp_g0 ? LPT[k] : prev;      /* (a point not passed this frame: none) */
+                        o += snprintf(b + o, sizeof b - o, "%s %.2f, ", LP_NAMES[k], (t - prev) / 1000.0f);
+                        prev = t;
+                        if (o >= (int)sizeof b - 40) break;
+                    }
+                    logm("  slow logic %.2f ms at %.1f s (state %d): %sdrawing setup %.2f", lp_ms, R.race_t, R.rs, b, (lp_g0 - prev) / 1000.0f);
+#ifdef NR_PC
+                    {   static const char *DSN[] = { "particles", "car parts", "ghosts", "portals", "objects", "sparks", "emitters", "gibs", "tracks", "rest" };
+                        char q[300]; int qo = 0; uint64_t pv = LPT[LP_CAMERA];
+                        for (int k = 0; k <= 9; k++) {
+                            uint64_t t = k < 9 ? DST[k] : lp_g0;
+                            if (t < pv || t > lp_g0) continue;                  /* (a mark not passed this frame) */
+                            qo += snprintf(q + qo, sizeof q - qo, "%s %.2f, ", DSN[k], (t - pv) / 1000.0f); pv = t;
+                        }
+                        if (lp_g0 - LPT[LP_CAMERA] > 150) logm("    drawing setup: %s", q);
+                    }
+#endif
+#ifdef NR_PC
+                    if (nr_objs_prof) {             /* (OBJPROF: the object kinds that took the most this frame) */
+                        char q[200]; int qo = 0;
+                        for (int r = 0; r < 4; r++) {
+                            int best = -1; for (int k = 0; k < 64; k++) if (nr_objs_kind_us[k] > 1 && (best < 0 || nr_objs_kind_us[k] > nr_objs_kind_us[best])) best = k;
+                            if (best < 0) break;
+                            qo += snprintf(q + qo, sizeof q - qo, " kind %d: %.0f us (%d)", best, nr_objs_kind_us[best], nr_objs_kind_n[best]);
+                            nr_objs_kind_us[best] = -nr_objs_kind_us[best];
+                        }
+                        logm("    objects by kind:%s", qo ? q : " -");
+                    }
+#endif
+                }
+            }
+#ifdef NR_PC
+            if (nr_objs_prof) { memset(nr_objs_kind_us, 0, sizeof nr_objs_kind_us); memset(nr_objs_kind_n, 0, sizeof nr_objs_kind_n); }
+            else if (getenv("OBJPROF")) nr_objs_prof = 1;
+#endif
             T_n++;
+            {   static char wh[96]; snprintf(wh, sizeof wh, "in a frame of %s at %.2f s (state %d)", R.lv ? R.lv->xml : "?", R.race_t, R.rs); gfx_ring_watch(wh); }
             {   /* a frame that took long: what it was doing (logged at most twice a second) */
                 static uint64_t last_slow;
                 uint64_t e = now_us();
-                if (e - c0 > 30000 && e - last_slow > 500000) {
+                if (e - c0 > 30000 && e - last_slow > 500000 && bench_mode < 0) {   /* (not the bench's: their pictures are read back) */
                     last_slow = e;
-                    logm("  slow frame %.0f ms at %.1f s: logic %.1f, draw %.1f [sky+cull %.1f (clear %.1f sky %.1f) level %.1f objects %.1f glow %.1f glow objects %.1f particles %.1f screen %.1f], hud %.1f, swap %.1f (state %d, objects %d drawn %d culled, particles %d, draws %d, tris %d)",
+                    char gq[160] = "";
+                    if (gpu_last_off >= 0) snprintf(gq, sizeof gq, " | the GPU's last measured frame: 3D and glow passes %.1f ms (the 3D scene %.1f), final pass's end %.1f ms after (at %.0f%%)",
+                                                    gpu_last_off, gpu_last_3d, gpu_last_fin, gpu_last_sc * 100);
+                    logm("  slow frame %.0f ms at %.1f s: logic %.1f, draw %.1f [sky+cull %.1f (clear %.1f sky %.1f) level %.1f objects %.1f glow %.1f glow objects %.1f particles %.1f screen %.1f], hud %.1f, swap %.1f (state %d, objects %d drawn %d culled, particles %d, draws %d, tris %d)%s",
                          (e - c0) / 1000.0f, R.race_t, (g0 - c0) / 1000.0f, (g1 - g0) / 1000.0f,
                          gfx_prof[0], gfx_prof[7], gfx_prof_sky, gfx_prof[1], gfx_prof[2], gfx_prof[3], gfx_prof[4], gfx_prof[5], gfx_prof[6],
-                         (s0 - g1) / 1000.0f, (e - s0) / 1000.0f, R.rs, gfx_objs_drawn, gfx_objs_culled, particles_count(), gfx_draws, gfx_tris);
+                         (s0 - g1) / 1000.0f, (e - s0) / 1000.0f, R.rs, gfx_objs_drawn, gfx_objs_culled, particles_count(), gfx_draws, gfx_tris, gq);
+                    /* (a very slow one in the race: the camera and the particles round it, a few a level) */
+                    static const void *pl_lv; static int pl_n;
+                    if (pl_lv != R.lv) { pl_lv = R.lv; pl_n = 0; }
+                    if (e - c0 > 60000 && R.rs == RS_RACE && particles_ok && pl_n < 4) { pl_n++; particles_log(); }
                 }
             }
             if (quit_app) { logm("Quit Game"); break; }   /* the pause menu's / results' Quit Game */
@@ -3721,6 +4895,7 @@ int main(void)
 
         float cpu = (now_us() - c0) / 1000.0f;
         float ms_frame = dt * 1000.0f;
+        if (mode == MODE_RACE && R.t > 0.5f && bench_mode < 0 && R.rs != RS_PAUSE) lvperf_frame(ms_frame, cpu, vsync_on);   /* (after the level's first half second; not the bench's frames) */
         win_frames++; win_cpu += cpu;
         if (ms_frame > win_worst) win_worst = ms_frame;
         if (ms_frame > 17.2f) win_over++;                  /* (with the cap off: frames that would miss the 60 fps display) */
@@ -3728,18 +4903,24 @@ int main(void)
             float secs = (tn - win_start) / 1e6f;
             int nv = 0, nd = 0, late = 0; float ld = 0, pk = 0; snd_stats(&nv, &nd, &ld); snd_peak(&pk, &late);
             if (mode == MODE_RACE)
-                logm("%s fps %.1f worst %.1f ms over16.7 %d%s frame %.2f ms = logic %.2f (phys %.2f) + draw %.2f + hud %.2f + gpu wait %.2f | 3d %.1f/%.1f ms | objects %d (+%d culled) draws %d tris %d | race %.1f s cp %d/%d speed %.0f heat %.0f blur %.2f | sound %d voices %d decoding load %.0f%% peak %.0f%% late %d",
+                logm("%s fps %.1f worst %.1f ms over16.7 %d%s frame %.2f ms = logic %.2f (phys %.2f, %u moving tris) + draw %.2f + hud %.2f + gpu wait %.2f | GPU %.1f ms a frame, worst %.1f (final pass: its end %.1f ms after the glow passes'), 3D scene at %.0f%% | objects %d (+%d culled) draws %d (%d instanced: %d objects) tris %d | race %.1f s cp %d/%d speed %.0f heat %.0f blur %.2f | sound %d voices %d decoding load %.0f%% peak %.0f%% late %d",
                      R.lv ? R.lv->xml : "?", win_frames / secs, win_worst, win_over, vsync_on ? "" : " (no cap)", win_cpu / win_frames,
-                     T_n ? T_logic / 1000.0f / T_n : 0, phys_us / 1000.0f / win_frames, T_n ? T_draw / 1000.0f / T_n : 0,
-                     T_n ? T_hud / 1000.0f / T_n : 0, T_n ? T_swap / 1000.0f / T_n : 0, win_gpu_n ? win_gpu_sum / win_gpu_n : 0, win_gpu,
-                     gfx_objs_drawn, gfx_objs_culled, gfx_draws, gfx_tris, R.race_t, R.cp_count, G.ncp, nr_car_speed(&R.car), R.heat, R.blur, nv, nd, ld * 100, pk * 100, late);
+                     T_n ? T_logic / 1000.0f / T_n : 0, phys_us / 1000.0f / win_frames, win_dyn, T_n ? T_draw / 1000.0f / T_n : 0,
+                     T_n ? T_hud / 1000.0f / T_n : 0, T_n ? T_swap / 1000.0f / T_n : 0, gpu_n ? gpu_sum / gpu_n : 0, gpu_max, gpu_n ? gpu_fin_sum / gpu_n : 0, gfx_scene_scale * 100,
+                     gfx_objs_drawn, gfx_objs_culled, gfx_draws, gfx_inst_draws, gfx_inst_objs, gfx_tris, R.race_t, R.cp_count, G.ncp, nr_car_speed(&R.car), R.heat, R.blur, nv, nd, ld * 100, pk * 100, late);
             else
-                logm("%s %d fps %.1f worst %.1f ms | sound %d voices %d decoding load %.0f%% peak %.0f%% late %d", mode == MODE_OUTRO ? "ending" : mode == MODE_INTRO ? "intro" : "menu screen", front_screen(), win_frames / secs, win_worst, nv, nd, ld * 100, pk * 100, late);
+                logm("%s %d fps %.1f worst %.1f ms | GPU %.1f ms a frame, worst %.1f | sound %d voices %d decoding load %.0f%% peak %.0f%% late %d", mode == MODE_OUTRO ? "ending" : mode == MODE_INTRO ? "intro" : "menu screen", front_screen(), win_frames / secs, win_worst,
+                     gpu_n ? gpu_sum / gpu_n : 0, gpu_max, nv, nd, ld * 100, pk * 100, late);
             {   char pb[200]; snd_prof(pb, sizeof pb);
 #ifdef NR_PC
                 late = 1;                                 /* (the PC test machine: always) */
 #endif
                 if (late || pk > 0.8f) logm("    mixer: %s", pb);
+                /* (a crowd of voices: what was posted to bring it on, and once a level what is playing) */
+                if (nv >= 40 || pk > 0.8f) {
+                    snd_ev_report(snd_log_line, "in the last 5 s", 10, 1);
+                    if (!lvp_snd_dumped) { lvp_snd_dumped = 1; snd_debug_dump(snd_log_line); }
+                } else snd_ev_report(NULL, "", 0, 1);
                 if (SHK.on && mode == MODE_RACE) { logm("    sparks: %d bolts, at most %d at once", SHK.made, SHK.most); SHK.made = SHK.most = 0; }
                 if (late && !autoplay) snd_debug_dump(snd_log_line);   /* (a gap: what was playing; autoplay dumps anyway) */
             }
@@ -3749,11 +4930,12 @@ int main(void)
                  || getenv("SND_DUMP")
 #endif
                 ) snd_debug_dump(snd_log_line);
-            win_start = tn; win_frames = 0; win_over = 0; win_worst = 0; win_cpu = 0; phys_us = 0; win_gpu = win_gpu_sum = 0; win_gpu_n = 0;
+            win_start = tn; win_frames = 0; win_over = 0; win_worst = 0; win_cpu = 0; phys_us = 0; win_dyn = 0; gpu_sum = gpu_max = gpu_fin_sum = 0; gpu_n = 0;
             T_all_busy += T_logic + T_draw + T_hud; T_all_swap += T_swap;
             T_logic = T_draw = T_hud = T_swap = 0; T_n = 0;
         }
     }
+    if (autoplay) { lvperf_end(); lvperf_summary(); }
     logm(autoplay ? "autoplay finished" : "leaving");
     (void)quit_app;
     save_write(&SAVE, SAVE_PATH);

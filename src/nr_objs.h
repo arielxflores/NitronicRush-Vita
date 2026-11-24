@@ -51,7 +51,7 @@ typedef struct {
 } nr_obj;
 
 typedef struct { char bp[40]; const char *line; } nr_proto;
-typedef struct { char name[48]; uint32_t n; float (*t)[9]; float r; float (*bb)[6]; } nr_cmodel;   /* bb: each triangle's box, own space */
+typedef struct { char name[48]; uint32_t n; float (*t)[9]; float r; float (*bb)[6]; nr_cgrid g; } nr_cmodel;   /* bb: each triangle's box, own space; g: their grid */
 
 typedef struct {
     void *user;
@@ -92,6 +92,8 @@ typedef struct {
     struct nr_humvee *hv; int nhv;
     nr_car_params hvp; int hvp_loaded;
     int outro;                               /* the ending's camera is running (CoreExploder works only then) */
+    int *fishl, nfish, *barl, nbar, lcap;     /* this frame's fish and barrels (the flock and the spawners look at these, not every object) */
+    float dyn_at[3], dyn_reach, dyn_near;     /* the frame's moving triangles: round dyn_at, the near ones gathered */
 } nr_objs;
 
 typedef struct {
@@ -127,6 +129,9 @@ void nr_objs_restart(nr_objs *W);          /* every object back as the level sta
 void nr_objs_update(nr_objs *W, nr_objs_frame *f, float dt);
 /* moving objects' triangles near 'at' into coll->dyn (before the car's physics steps) */
 void nr_objs_collision(nr_objs *W, const float at[3], float reach);
+/* the same, gathering at once only those within reach_near (the car's own physics); the rest of reach when a
+ * longer query (nr_coll_ray / nr_coll_sphere) asks for them */
+void nr_objs_collision2(nr_objs *W, const float at[3], float reach_near, float reach);
 /* CarLogic's collision rules (0x709290) over the car's contacts of this frame */
 void nr_objs_car_contacts(nr_objs *W, nr_car *c, int wings_out, nr_objs_hit *h);
 void nr_objs_matrix(const nr_obj *o, float m[4][4]);

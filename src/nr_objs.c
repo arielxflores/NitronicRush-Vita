@@ -8,7 +8,13 @@
 #define PI_F 3.14159265f
 struct nr_humvee { nr_car car; float acc; int obj, used; };   /* a CORE drone's car */
 static void humvee_free(nr_objs *W, int i);
+static int hv_params(nr_objs *W);
 
+#ifdef NR_PC
+#include <time.h>
+double nr_objs_kind_us[64]; int nr_objs_kind_n[64], nr_objs_prof;
+static double ou_now(void) { struct timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
+#endif
 /* ------------------------------------------------------------------ small maths */
 static float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static float len3(const float *a) { return sqrtf(dot3(a, a)); }
@@ -70,16 +76,96 @@ static float frand(nr_objs *W) { return (rnd(W) >> 8) * (1.0f / 16777216.0f); }
 static float frange(nr_objs *W, float a, float b) { return a + (b - a) * frand(W); }
 
 /* ------------------------------------------------------------------ .nrg line values */
+/* each line's keys found once, and their numbers read once: kv's strstr over lines of a thousand characters, thirty
+ * keys an object, and strtof for each number made a race's restart (the objects made anew from their lines) and each
+ * spawned piece cost the Vita milliseconds. The same values as reading the line each time (the same first match, the
+ * same strtof) */
+typedef struct { uint32_t h, k, kl, v, foff; int nf, aux; } kv_tok;         /* nf: numbers read (-1: not yet; 17: over 16); aux: a model's place + 2 */
+typedef struct { const char *line; uint32_t first, n; } kv_line;
+static const char *KV_LO, *KV_HI;                                         /* the cached lines' text */
+static kv_line *KVL; static uint32_t KVL_CAP, KVL_N;
+static kv_tok *KVT; static uint32_t KVT_N, KVT_CAP;
+static float *KVF; static uint32_t KVF_N, KVF_CAP;
+static void kv_reset(const char *lo, const char *hi)
+{
+    free(KVL); free(KVT); free(KVF); KVL = NULL; KVT = NULL; KVF = NULL;
+    KVL_CAP = KVL_N = KVT_N = KVT_CAP = KVF_N = KVF_CAP = 0; KV_LO = lo; KV_HI = hi;
+}
+static uint32_t kv_hash(const char *s, size_t n) { uint32_t h = 2166136261u; for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 16777619u; } return h; }
+static uint32_t kv_slot(const char *line) { uintptr_t x = (uintptr_t)line; x ^= x >> 17; x *= 0x9e3779b1u; return (uint32_t)x & (KVL_CAP - 1); }
+static const kv_line *kv_line_of(const char *line)
+{
+    if (KVL_CAP) for (uint32_t i = kv_slot(line);; i = (i + 1) & (KVL_CAP - 1)) {
+        if (KVL[i].line == line) return &KVL[i];
+        if (!KVL[i].line) break;
+    }
+    if (2 * (KVL_N + 1) > KVL_CAP) {                     /* (grow: twice the size, the lines placed anew) */
+        uint32_t oc = KVL_CAP, nc = oc ? oc * 2 : 1024; kv_line *o = KVL;
+        KVL = calloc(nc, sizeof *KVL); if (!KVL) { KVL = o; return NULL; }
+        KVL_CAP = nc;
+        for (uint32_t i = 0; i < oc; i++) if (o[i].line) { uint32_t j = kv_slot(o[i].line); while (KVL[j].line) j = (j + 1) & (nc - 1); KVL[j] = o[i]; }
+        free(o);
+    }
+    uint32_t i = kv_slot(line); while (KVL[i].line) i = (i + 1) & (KVL_CAP - 1);
+    kv_line *L = &KVL[i]; L->line = line; L->first = KVT_N; L->n = 0; KVL_N++;
+    /* its keys: a word at the line's start or after a space, up to an '=' within it */
+    for (const char *p = line; *p; ) {
+        const char *w = p; while (*p && *p != ' ' && *p != '=') p++;
+        if (*p == '=' && p > w) {
+            if (KVT_N == KVT_CAP) { uint32_t nc = KVT_CAP ? KVT_CAP * 2 : 4096; void *t = realloc(KVT, sizeof *KVT * nc); if (!t) break; KVT = t; KVT_CAP = nc; }
+            kv_tok *T = &KVT[KVT_N++]; L->n++;
+            T->k = (uint32_t)(w - line); T->kl = (uint32_t)(p - w); T->h = kv_hash(w, T->kl); T->v = T->k + T->kl + 1; T->nf = -1; T->foff = 0; T->aux = 0;
+        }
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+    }
+    return L;
+}
+static kv_tok *kv_tok_of(const char *line, const char *key)
+{
+    const kv_line *L = kv_line_of(line);
+    if (!L) return NULL;
+    size_t kl = strlen(key); uint32_t h = kv_hash(key, kl);
+    for (uint32_t i = L->first; i < L->first + L->n; i++) {
+        kv_tok *T = &KVT[i];
+        if (T->h == h && T->kl == kl && !memcmp(line + T->k, key, kl)) return T;
+    }
+    return NULL;
+}
+static void kv_numbers(const char *line, kv_tok *T)          /* its numbers, as kvv reads them (at most 16 kept) */
+{
+    if (T->nf >= 0) return;
+    float f[17]; int k = 0; const char *v = line + T->v;
+    while (k < 17) {
+        char *e; float x = strtof(v, &e);
+        if (e == v) break;
+        f[k++] = x; v = e;
+        if (*v == ',') v++; else break;
+    }
+    if (KVF_N + 16 > KVF_CAP) { uint32_t nc = KVF_CAP ? KVF_CAP * 2 : 8192; void *t = realloc(KVF, sizeof *KVF * nc); if (!t) return; KVF = t; KVF_CAP = nc; }
+    T->foff = KVF_N; memcpy(KVF + KVF_N, f, sizeof(float) * (k < 16 ? k : 16)); KVF_N += k < 16 ? k : 16;
+    T->nf = k;
+}
 static const char *kv(const char *line, const char *key)
 {
+    if (line >= KV_LO && line < KV_HI) { const kv_tok *T = kv_tok_of(line, key); return T ? line + T->v : NULL; }
     size_t kl = strlen(key);
     for (const char *p = line; p && (p = strstr(p, key)); p++)
         if ((p == line || p[-1] == ' ') && p[kl] == '=') return p + kl + 1;
     return NULL;
 }
-static float kvf(const char *line, const char *key, float d) { const char *v = kv(line, key); return v ? strtof(v, NULL) : d; }
 static int kvv(const char *line, const char *key, float *out, int n)
 {
+    if (line >= KV_LO && line < KV_HI) {
+        kv_tok *T = kv_tok_of(line, key);
+        if (!T) return 0;
+        kv_numbers(line, T);
+        if (T->nf >= 0 && (n <= 16 || T->nf <= 16)) {
+            int k = T->nf < n ? T->nf : n; if (k > 16) k = 16;
+            memcpy(out, KVF + T->foff, sizeof(float) * k);
+            return k;
+        }
+    }
     const char *v = kv(line, key); int k = 0;
     while (v && k < n) {
         char *e; float x = strtof(v, &e);
@@ -88,6 +174,17 @@ static int kvv(const char *line, const char *key, float *out, int n)
         if (*v == ',') v++; else break;
     }
     return k;
+}
+static float kvf(const char *line, const char *key, float d)
+{
+    if (line >= KV_LO && line < KV_HI) {
+        kv_tok *T = kv_tok_of(line, key);
+        if (!T) return d;
+        kv_numbers(line, T);
+        if (T->nf >= 1) return KVF[T->foff];
+        if (T->nf == 0) return strtof(line + T->v, NULL);
+    }
+    const char *v = kv(line, key); return v ? strtof(v, NULL) : d;
 }
 static int kvs(const char *line, const char *key, char *out, int n)
 {
@@ -100,18 +197,25 @@ static int kvs(const char *line, const char *key, char *out, int n)
 static int has(const char *line, const char *prefix) { char b[64]; snprintf(b, sizeof b, " %s", prefix); return strstr(line, b) != NULL; }
 
 /* ------------------------------------------------------------------ models and collision shapes */
-static int model_of(nr_objs *W, const char *name, float bmin[3], float bmax[3])
+static int model_idx(nr_objs *W, const char *name)          /* -> its place in W->mdl (loaded now if new), -1: none */
 {
-    set3(bmin, -1, -1, -1); set3(bmax, 1, 1, 1);
     if (!name[0] || !strcmp(name, "-")) return -1;
-    for (int i = 0; i < W->nmdl; i++) if (!strcmp(W->mdl[i].name, name)) { memcpy(bmin, W->mdl[i].bmin, 12); memcpy(bmax, W->mdl[i].bmax, 12); return W->mdl[i].h; }
+    for (int i = 0; i < W->nmdl; i++) if (!strcmp(W->mdl[i].name, name)) return i;
     void *t = realloc(W->mdl, sizeof *W->mdl * (W->nmdl + 1)); if (!t) return -1;
     W->mdl = t;
+    float bmin[3] = { -1, -1, -1 }, bmax[3] = { 1, 1, 1 };
     int h = W->host.model ? W->host.model(W->host.user, name, bmin, bmax) : -1;
     snprintf(W->mdl[W->nmdl].name, sizeof W->mdl[W->nmdl].name, "%s", name);
     W->mdl[W->nmdl].h = h; memcpy(W->mdl[W->nmdl].bmin, bmin, 12); memcpy(W->mdl[W->nmdl].bmax, bmax, 12);
-    W->nmdl++;
-    return h;
+    return W->nmdl++;
+}
+static int model_of(nr_objs *W, const char *name, float bmin[3], float bmax[3])
+{
+    set3(bmin, -1, -1, -1); set3(bmax, 1, 1, 1);
+    int i = model_idx(W, name);
+    if (i < 0) return -1;
+    memcpy(bmin, W->mdl[i].bmin, 12); memcpy(bmax, W->mdl[i].bmax, 12);
+    return W->mdl[i].h;
 }
 
 static int cmodel_of(nr_objs *W, const char *name)
@@ -159,6 +263,7 @@ static int cmodel_of(nr_objs *W, const char *name)
         float a = m.t[i][k], b = m.t[i][3 + k], c = m.t[i][6 + k];
         m.bb[i][k] = fminf(a, fminf(b, c)); m.bb[i][3 + k] = fmaxf(a, fmaxf(b, c));
     }
+    nr_cgrid_build(&m.g, (const float (*)[6])m.bb, m.n);
     void *t = realloc(W->cm, sizeof *W->cm * (W->ncm + 1)); if (!t) { free(m.t); return -1; }
     W->cm = t; W->cm[W->ncm] = m;
     return W->ncm++;
@@ -195,8 +300,16 @@ static int obj_new(nr_objs *W, int kind, const char *line)
     memset(o, 0, sizeof *o);
     o->kind = kind; o->alive = 1; o->visible = 1; o->parent = -1; o->proto = -1; o->snd_slot = -1; o->line = line;
     char b[64];
-    kvs(line, "m", b, sizeof b); o->model = model_of(W, b, o->bmin, o->bmax);
-    kvs(line, "cm", b, sizeof b); o->cmodel = cmodel_of(W, b);
+    {   /* its model and collision shape (found once a line: spawned pieces come from the same few lines) */
+        kv_tok *Tm = line >= KV_LO && line < KV_HI ? kv_tok_of(line, "m") : NULL, *Tc = line >= KV_LO && line < KV_HI ? kv_tok_of(line, "cm") : NULL;
+        int mi;
+        if (Tm && Tm->aux) mi = Tm->aux - 2;
+        else { kvs(line, "m", b, sizeof b); mi = model_idx(W, b); if (Tm) Tm->aux = mi + 2; }
+        set3(o->bmin, -1, -1, -1); set3(o->bmax, 1, 1, 1); o->model = -1;
+        if (mi >= 0) { o->model = (int16_t)W->mdl[mi].h; memcpy(o->bmin, W->mdl[mi].bmin, 12); memcpy(o->bmax, W->mdl[mi].bmax, 12); }
+        if (Tc && Tc->aux) o->cmodel = (int16_t)(Tc->aux - 2);
+        else { kvs(line, "cm", b, sizeof b); o->cmodel = (int16_t)cmodel_of(W, b); if (Tc) Tc->aux = o->cmodel + 2; }
+    }
     o->cmat = (uint8_t)kvf(line, "cmat", 0); o->matid = (uint8_t)kvf(line, "mid", 0); o->death_speed = kvf(line, "ds", 0);
     float r[9] = { 0 };
     if (kvv(line, "p", o->pos, 3) < 3) set3(o->pos, 0, 0, 0);
@@ -757,7 +870,7 @@ static void create_all(nr_objs *W)
     }
     free(W->off);
     W->noff = maxid + 1; W->off = calloc(W->noff, 1);
-    if (W->coll) { W->coll->off = W->off; W->coll->noff = W->noff; W->coll->bodies = W->bodies; W->coll->ndyn = 0; }
+    if (W->coll) { W->coll->off = W->off; W->coll->noff = W->noff; W->coll->bodies = W->bodies; W->coll->ndyn = 0; W->coll->ndobj = 0; W->coll->dyn_pending = 0; }
     int n0 = W->n;
     for (int i = 0; i < n0; i++) init_obj(W, i);
 }
@@ -769,6 +882,7 @@ int nr_objs_load(nr_objs *W, const char *nrg, nr_coll *coll, const nr_objs_host 
     size_t n = strlen(nrg);
     W->text = malloc(n + 2); memcpy(W->text, nrg, n + 1); W->text[n + 1] = 0;
     W->textlen = (int)n + 1;
+    kv_reset(W->text, W->text + n + 1);
     for (char *p = W->text; *p; p++) if (*p == '\n' || *p == '\r') *p = 0;
     /* blueprints the logic spawns */
     for (const char *p = W->text; p < W->text + n; p = strchr(p, '\0') + 1) {
@@ -786,6 +900,11 @@ int nr_objs_load(nr_objs *W, const char *nrg, nr_coll *coll, const nr_objs_host 
         if (kvs(W->proto[i].line, "cm", b, sizeof b)) cmodel_of(W, b);
     }
     create_all(W);
+    for (int i = 0; i < W->n; i++)          /* the CORE drones' car and model too (Christmas Court's garages: 3 ms) */
+        if (W->o[i].kind == OK_GARAGE || W->o[i].kind == OK_HUMVEE) {
+            float mn[3], mx[3]; hv_params(W); model_of(W, "humvee", mn, mx);
+            break;
+        }
     return W->n;
 }
 
@@ -799,8 +918,10 @@ void nr_objs_free(nr_objs *W)
 {
     for (int i = 0; i < NTRAINP; i++) bez_free(&TRAINP[i]);
     NTRAINP = 0;
-    for (int i = 0; i < W->ncm; i++) { free(W->cm[i].t); free(W->cm[i].bb); }
-    if (W->coll) { W->coll->off = NULL; W->coll->noff = 0; W->coll->bodies = NULL; W->coll->ndyn = 0; }
+    for (int i = 0; i < W->ncm; i++) { free(W->cm[i].t); free(W->cm[i].bb); nr_cgrid_free(&W->cm[i].g); }
+    if (W->coll) { W->coll->off = NULL; W->coll->noff = 0; W->coll->bodies = NULL; W->coll->ndyn = 0; W->coll->ndobj = 0; W->coll->dyn_pending = 0; W->coll->dyn_more = NULL; }
+    kv_reset(NULL, NULL);
+    free(W->fishl); free(W->barl);
     free(W->o); free(W->proto); free(W->cm); free(W->mdl); free(W->off); free(W->bodies); free(W->text); free(W->hv);
     memset(W, 0, sizeof *W);
 }
@@ -933,9 +1054,9 @@ static void stomper_next(nr_objs *W, int i, const nr_objs_frame *f)
     case 2: {
         float travel = 1, dist, nn[3], down[3] = { -Z[0], -Z[1], -Z[2] };
         if (W->coll && D > 0) {
-            uint32_t saved = W->coll->ndyn; W->coll->ndyn = 0;
+            W->coll->no_dyn++;
             if (nr_coll_ray(W->coll, rest, down, D, &dist, nn, NULL)) travel = dist / D;
-            W->coll->ndyn = saved;
+            W->coll->no_dyn--;
         }
         float seg[3] = { down[0] * D, down[1] * D, down[2] * D }, tc;
         if (seg_hits_car(f, rest, seg, &tc) && tc < travel) travel = tc;     /* the ray hits the car too */
@@ -1115,7 +1236,8 @@ static void fish_update(nr_objs *W, int i, const nr_objs_frame *f, float dt)
     float d[3] = { o->f[0] - o->pos[0], o->f[1] - o->pos[1], o->f[2] - o->pos[2] };
     if (dot3(d, d) < 36) { fish_target(W, o, f); for (int k = 0; k < 3; k++) d[k] = o->f[k] - o->pos[k]; }
     float sep[3] = { 0, 0, 0 }, coh[3] = { 0, 0, 0 }, al[3] = { 0, 0, 0 }; int nn = 0;
-    for (int j = 0; j < W->n; j++) {
+    for (int jl = 0, nl = W->nfish >= 0 ? W->nfish : W->n; jl < nl; jl++) {
+        int j = W->nfish >= 0 ? W->fishl[jl] : jl;
         nr_obj *q = &W->o[j];
         if (j == i || !q->alive || q->kind != OK_FISH) continue;
         float e[3] = { q->pos[0] - o->pos[0], q->pos[1] - o->pos[1], q->pos[2] - o->pos[2] }, e2 = dot3(e, e);
@@ -1326,11 +1448,11 @@ static void humvee_update(nr_objs *W, int i, nr_objs_frame *f, float dt)
     c->ncontact = 0; c->body_touch = 0;
     h->acc += dt;
     if (W->coll) {
-        uint32_t saved = W->coll->ndyn; W->coll->ndyn = 0;
+        W->coll->no_dyn++;
         int steps = 0;
         while (h->acc >= NR_CAR_DT && steps < 12) { nr_car_step(c, &W->hvp, W->coll, NR_CAR_DT); h->acc -= NR_CAR_DT; steps++; }
         if (steps == 12) h->acc = 0;
-        W->coll->ndyn = saved;
+        W->coll->no_dyn--;
     }
     memcpy(o->pos, c->pos, 12); memcpy(o->R, c->rot, 36); memcpy(o->vel, c->vel, 12); memcpy(o->angvel, c->angvel, 12);
     /* the contact pass (0x6c2d70): lava, or > 30 into the level, destroys it */
@@ -1393,9 +1515,9 @@ static void phaser_update(nr_objs *W, int i, nr_objs_frame *f, float dt)
     float dir[3]; colv(o->R, 2, dir);
     float L = o->f[0] * dt, best = L, hit = 0, dist, n[3];
     if (W->coll) {
-        uint32_t saved = W->coll->ndyn; W->coll->ndyn = 0;
+        W->coll->no_dyn++;
         if (nr_coll_ray(W->coll, o->pos, dir, L, &dist, n, NULL) && dist < best) { best = dist; hit = 1; }
-        W->coll->ndyn = saved;
+        W->coll->no_dyn--;
     }
     float seg[3] = { dir[0] * L, dir[1] * L, dir[2] * L }, tc;
     if (seg_hits_car(f, o->pos, seg, &tc) && tc * L < best) { best = tc * L; hit = 1; }
@@ -1978,7 +2100,7 @@ static void update_obj(nr_objs *W, int i, nr_objs_frame *f, float dt)
     }
     case OK_BARRELSPAWNER: {
         int alive = 0;
-        for (int k = 0; k < W->n; k++) if (W->o[k].alive && W->o[k].kind == OK_BARREL && W->o[k].s[0] == i) alive++;
+        for (int kl = 0, nl = W->nbar >= 0 ? W->nbar : W->n; kl < nl; kl++) { int k = W->nbar >= 0 ? W->barl[kl] : kl; if (W->o[k].alive && W->o[k].kind == OK_BARREL && W->o[k].s[0] == i) alive++; }
         if (f->car_active) {
             float d[3] = { o->pos[0] - cp[0], o->pos[1] - cp[1], o->pos[2] - cp[2] };
             if (dot3(d, d) < o->f[1]) {
@@ -2023,9 +2145,9 @@ static void update_obj(nr_objs *W, int i, nr_objs_frame *f, float dt)
         int ground = 0;
         for (int k = -1; k <= 1 && W->coll; k++) {
             float c[3] = { o->pos[0] + a[0] * 1.4f * k, o->pos[1] + a[1] * 1.4f * k, o->pos[2] + a[2] * 1.4f * k }, push[3], n[3];
-            int saved = (int)W->coll->ndyn; W->coll->ndyn = 0;
+            W->coll->no_dyn++;
             int h = nr_coll_sphere(W->coll, c, Rb, push, n);
-            W->coll->ndyn = (uint32_t)saved;
+            W->coll->no_dyn--;
             if (!h) continue;
             madd3(o->pos, push, 1.0f / 3);
             float vn = dot3(o->vel, n);
@@ -2056,14 +2178,14 @@ static void update_obj(nr_objs *W, int i, nr_objs_frame *f, float dt)
         madd3(o->pos, o->vel, dt);
         float push[3], n[3];
         if (W->coll && o->f[0] > 0) {
-            int saved = (int)W->coll->ndyn; W->coll->ndyn = 0;
+            W->coll->no_dyn++;
             float r = 0.3f * fmaxf(o->scale[0], 1);
             if (nr_coll_sphere(W->coll, o->pos, r, push, n)) {
                 madd3(o->pos, push, 1);
                 float vn = dot3(o->vel, n);
                 if (vn < 0) { madd3(o->vel, n, -1.35f * vn); for (int j = 0; j < 3; j++) { o->vel[j] *= 0.75f; o->angvel[j] *= 0.7f; } }
             }
-            W->coll->ndyn = (uint32_t)saved;
+            W->coll->no_dyn--;
         }
         rotate_by(o->R, o->angvel, dt);
         break;
@@ -2275,13 +2397,13 @@ static void update_obj(nr_objs *W, int i, nr_objs_frame *f, float dt)
         rotate_by(o->R, o->angvel, dt);
         int contact = 0; float r = fmaxf(o->scale[0], 0.1f);
         if (W->coll) {
-            uint32_t saved = W->coll->ndyn; W->coll->ndyn = 0;
+            W->coll->no_dyn++;
             float push[3], n[3];
             if (nr_coll_sphere(W->coll, o->pos, r, push, n)) {
                 contact = 1; madd3(o->pos, push, 1);
                 float vn = dot3(o->vel, n); if (vn < 0) madd3(o->vel, n, -1.05f * vn);
             }
-            W->coll->ndyn = saved;
+            W->coll->no_dyn--;
         }
         if (f->car_active && car_box_dist(f, o->pos) < r) contact = 1;
         if ((contact && o->t > o->f[0]) || o->t > o->f[1] || o->pos[2] < -70) mortar_explode(W, i, f);
@@ -2415,9 +2537,26 @@ void nr_objs_update(nr_objs *W, nr_objs_frame *f, float dt)
     if (dt > 0.1f) dt = 0.1f;
     W->time += dt;
     int n0 = W->n;                    /* objects spawned now start next frame */
+    if (W->lcap < n0) {               /* the fish and the barrels now (no fish comes or goes; a barrel spawned now is another spawner's) */
+        int nc = n0 + 256; void *a = realloc(W->fishl, sizeof(int) * nc), *b = a ? realloc(W->barl, sizeof(int) * nc) : NULL;
+        if (a) W->fishl = a;
+        if (b) { W->barl = b; W->lcap = nc; }
+    }
+    W->nfish = W->nbar = W->lcap >= n0 ? 0 : -1;                /* (-1: no lists, every object looked at) */
+    for (int i = 0; i < n0 && W->lcap >= n0; i++) if (W->o[i].alive) {
+        if (W->o[i].kind == OK_FISH) W->fishl[W->nfish++] = i;
+        else if (W->o[i].kind == OK_BARREL) W->barl[W->nbar++] = i;
+    }
     for (int i = 0; i < n0; i++) {
         nr_obj *o = &W->o[i];
         if (!o->alive) continue;
+#ifdef NR_PC
+        if (nr_objs_prof) {               /* (the test machine: the time each kind takes) */
+            int kd = o->kind; double t0 = ou_now();
+            update_obj(W, i, f, dt);
+            nr_objs_kind_us[kd & 63] += ou_now() - t0; nr_objs_kind_n[kd & 63]++;
+        } else
+#endif
         update_obj(W, i, f, dt);
         o = &W->o[i];
         if (o->pulse > 0 && o->alive)   /* LightPulse: the glow flashes on the music's beat */
@@ -2433,55 +2572,57 @@ static int moves(int k)
            k == OK_FOOT || k == OK_DROPBLOCK;
 }
 
-void nr_objs_collision(nr_objs *W, const float at[3], float reach)
+/* the moving objects whose sphere meets the cube of half size 'reach' round 'at', listed for this frame's queries (pass
+ * 1: the near cube's; 2: the rest of the reach). The queries take their triangles whose own box meets the cube in the
+ * object's space (lp, rl) and whose world box meets it (pass 2: and not the near one, pass 1's), when they need them */
+static void dyn_collect(nr_objs *W, const float at[3], float reach, int pass)
 {
     nr_coll *c = W->coll;
-    if (!c) return;
-    c->ndyn = 0; c->bodies = W->bodies;
     for (int i = 0; i < W->n; i++) {
         nr_obj *o = &W->o[i];
         if (!o->alive || o->cmodel < 0 || !moves(o->kind)) continue;
         const nr_cmodel *m = &W->cm[o->cmodel];
         float sc = fmaxf(fabsf(o->scale[0]), fmaxf(fabsf(o->scale[1]), fabsf(o->scale[2])));
-        float d[3] = { o->pos[0] - at[0], o->pos[1] - at[1], o->pos[2] - at[2] }, rr = m->r * sc + reach;
-        if (dot3(d, d) > rr * rr) continue;
+        float d[3] = { o->pos[0] - at[0], o->pos[1] - at[1], o->pos[2] - at[2] }, q2 = 0, mr = m->r * sc;
+        for (int k = 0; k < 3; k++) { float e = fabsf(d[k]) - reach; if (e > 0) q2 += e * e; }   /* the sphere to the cube */
+        if (q2 > mr * mr) continue;
         memcpy(W->bodies[i].c, o->pos, 12); memcpy(W->bodies[i].v, o->vel, 12); memcpy(W->bodies[i].w, o->angvel, 12);
-        float det = o->scale[0] * o->scale[1] * o->scale[2];
-        uint32_t mat = (o->cmat & 15u) | ((o->matid & 15u) << 4) | ((uint32_t)i << 8) | NR_TRI_DYN;
-        /* the reach in the object's own space: skip triangles there before moving them (big meshes
-         * such as the Nitro Tunnel's tube) */
-        float lp[3], rl = reach / fmaxf(fminf(fabsf(o->scale[0]), fminf(fabsf(o->scale[1]), fabsf(o->scale[2]))), 1e-3f);
+        if (!m->n || !m->bb) continue;
+        nr_cdobj D; memset(&D, 0, sizeof D);
+        D.t = (const float (*)[9])m->t; D.bb = (const float (*)[6])m->bb; D.g = m->g; D.n = m->n;
+        D.mat = (o->cmat & 15u) | ((o->matid & 15u) << 4) | ((uint32_t)i << 8) | NR_TRI_DYN;
+        D.flip = o->scale[0] * o->scale[1] * o->scale[2] < 0; D.pass = pass;
+        memcpy(D.R, o->R, 36); memcpy(D.pos, o->pos, 12); memcpy(D.scale, o->scale, 12);
+        /* the cube in the object's own space (its box there): the triangles outside it are never moved (big meshes such
+         * as the Nitro Tunnel's tube, the Evil Carwash's crushers) */
         for (int k = 0; k < 3; k++) {
             float a[3]; colv(o->R, k, a);
-            lp[k] = (a[0] * (-d[0]) + a[1] * (-d[1]) + a[2] * (-d[2])) / (fabsf(o->scale[k]) > 1e-6f ? o->scale[k] : 1);
+            float s_ = fabsf(o->scale[k]) > 1e-6f ? o->scale[k] : 1;
+            D.lp[k] = (a[0] * (-d[0]) + a[1] * (-d[1]) + a[2] * (-d[2])) / s_;
+            D.rl[k] = reach * (fabsf(a[0]) + fabsf(a[1]) + fabsf(a[2])) / fabsf(s_) + 1e-4f;
         }
-        for (uint32_t t = 0; t < m->n; t++) {
-            if (m->bb) {
-                const float *b = m->bb[t];
-                if (b[3] < lp[0] - rl || b[0] > lp[0] + rl || b[4] < lp[1] - rl || b[1] > lp[1] + rl || b[5] < lp[2] - rl || b[2] > lp[2] + rl) continue;
-            }
-            if (c->ndyn == c->dyncap) {
-                uint32_t nc = c->dyncap ? c->dyncap * 2 : 1024;
-                void *p = realloc(c->dyn, sizeof *c->dyn * nc); if (!p) return;
-                c->dyn = p; c->dyncap = nc;
-            }
-            nr_ctri *T = &c->dyn[c->ndyn];
-            for (int j = 0; j < 3; j++) to_world(o, &m->t[t][j * 3], T->v[det < 0 ? 2 - j : j]);
-            float e1[3] = { T->v[1][0] - T->v[0][0], T->v[1][1] - T->v[0][1], T->v[1][2] - T->v[0][2] };
-            float e2[3] = { T->v[2][0] - T->v[0][0], T->v[2][1] - T->v[0][1], T->v[2][2] - T->v[0][2] };
-            int out = 0;          /* only what the car can reach this frame */
-            for (int j = 0; j < 3 && !out; j++) {
-                float lo = fminf(T->v[0][j], fminf(T->v[1][j], T->v[2][j])), hi = fmaxf(T->v[0][j], fmaxf(T->v[1][j], T->v[2][j]));
-                if (hi < at[j] - reach || lo > at[j] + reach) out = 1;
-            }
-            if (out) continue;
-            cross3(e1, e2, T->n);
-            if (len3(T->n) < 1e-9f) continue;
-            norm3(T->n);
-            T->mat = mat;
-            c->ndyn++;
-        }
+        nr_coll_dyn_add(c, &D, mr);
     }
+}
+static void dyn_more(void *u)
+{
+    nr_objs *W = u;
+    dyn_collect(W, W->dyn_at, W->dyn_reach, 2);
+    W->coll->dyn_gen++;
+}
+void nr_objs_collision(nr_objs *W, const float at[3], float reach) { nr_objs_collision2(W, at, reach, reach); }
+void nr_objs_collision2(nr_objs *W, const float at[3], float reach_near, float reach)
+{
+    nr_coll *c = W->coll;
+    if (!c) return;
+    c->bodies = W->bodies; c->dyn_gen++;
+    if (reach_near > reach) reach_near = reach;
+    nr_coll_dyn_begin(c, at, reach_near, reach);
+    dyn_collect(W, at, reach_near, 1);
+    for (int k = 0; k < 3; k++) { c->dyn_lo[k] = at[k] - reach_near; c->dyn_hi[k] = at[k] + reach_near; }
+    memcpy(W->dyn_at, at, 12); W->dyn_reach = reach; W->dyn_near = reach_near;
+    c->dyn_more = dyn_more; c->dyn_user = W;
+    c->dyn_pending = reach > reach_near;
 }
 
 static nr_obj *obj_of(nr_objs *W, uint32_t mat)

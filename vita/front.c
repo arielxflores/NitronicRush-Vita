@@ -487,9 +487,11 @@ static float *opt_vol(int r)
     switch (r) { case OPT_MUSIC: return &S->music; case OPT_SFX: return &S->sfx; case OPT_ANN: return &S->announcer; case OPT_MASTER: return &S->master; }
     return NULL;
 }
-/* Controls: the actions, the sticks, Use Advanced Controls, then Reset to Defaults and Back side by side */
-enum { CTL_STICKS = ACT_N, CTL_ADV, CTL_AIR, CTL_RESET, CTL_BACK, CTL_N };
-#define CTL_DY 33                                 /* the rows' spacing */
+/* Controls: the actions, the sticks, Use Advanced Controls, the air tricks, the camera stick's two ways round, then
+ * Reset to Defaults and Back side by side */
+enum { CTL_STICKS = ACT_N, CTL_ADV, CTL_AIR, CTL_CAMX, CTL_CAMY, CTL_RESET, CTL_BACK, CTL_N };
+#define CTL_Y0 52                                 /* the first row's top */
+#define CTL_DY 28                                 /* the rows' spacing */
 /* the Roll may only go on the brake's button or on a free one (it would otherwise leave two actions on one button) */
 static int trick_ok(int b)
 {
@@ -509,6 +511,7 @@ int front_update(float dt, const fe_input *in_, int *out_set, int *out_level)
 {
     fe_input I = *in_; const fe_input *in = &I;     /* (the touch screen presses the buttons in this copy) */
     scr_t += dt;
+    hud_tex_poll();                                  /* (a level picture the I/O thread has read, made a texture) */
     if (!overlay) ui_popup_update(dt);
     switch (scr) {
     case FE_SPLASH: {
@@ -682,7 +685,7 @@ int front_update(float dt, const fe_input *in_, int *out_set, int *out_level)
             break;
         }
         /* touch: a row selects it (again: Set, or the switch on the two switch rows), the two buttons */
-        for (int i = 0; i < CTL_RESET; i++) if (hit_r(in, 130, 56 + i * CTL_DY, 700, CTL_DY - 3)) {
+        for (int i = 0; i < CTL_RESET; i++) if (hit_r(in, 130, CTL_Y0 + i * CTL_DY, 700, CTL_DY - 3)) {
             if (i != sel_ctl) { sel_ctl = i; snd_post("Play_MenuMoveLowShort", 0); if (i >= ACT_N) I.accept = 1; }
             else I.accept = 1;
         }
@@ -699,9 +702,11 @@ int front_update(float dt, const fe_input *in_, int *out_set, int *out_level)
         else if (sel_ctl == CTL_STICKS && (in->accept || in->left || in->right)) S->swap_sticks = !S->swap_sticks;
         else if (sel_ctl == CTL_ADV && (in->accept || in->left || in->right)) S->adv_controls = !S->adv_controls;
         else if (sel_ctl == CTL_AIR && (in->accept || in->left || in->right)) S->air_tricks = !S->air_tricks;
+        else if (sel_ctl == CTL_CAMX && (in->accept || in->left || in->right)) S->cam_inv_x = !S->cam_inv_x;
+        else if (sel_ctl == CTL_CAMY && (in->accept || in->left || in->right)) S->cam_inv_y = !S->cam_inv_y;
         else if (sel_ctl == CTL_RESET && in->accept) {
             for (int k = 0; k < ACT_N; k++) S->bind[k] = ACT_DEFAULT[k];
-            S->swap_sticks = 0; S->air_tricks = 1; snd_post("Play_MenuMoveLowShort", 0);
+            S->swap_sticks = 0; S->air_tricks = 1; S->cam_inv_x = S->cam_inv_y = 0; snd_post("Play_MenuMoveLowShort", 0);
         }
         if (in->back || (sel_ctl == CTL_BACK && in->accept)) return leave();
         break; }
@@ -837,6 +842,10 @@ void front_draw(void)
         for (int i = top; i < n && i < top + 7; i++) ui_button(300, 110 + (i - top) * 50, 360, 54, FE_SETS[i].name, i == sel_set, 1);
         if (n) {
             fe_set *s = &FE_SETS[sel_set];
+            if (s->n) {                                      /* (the level select's first pictures, read ahead) */
+                const char *w[3] = { s->lv[0].img, s->lv[s->n > 1].img, s->lv[s->n - 1].img };
+                for (int k = 0; k < 3; k++) if (w[k][0]) hud_tex_want(w[k]);
+            }
             hud_rect(510, 100, 420, 300, 0x000000A0);
             hud_text(HUD_FONT_MAIN, 720, 112, 26, 0x9FE8FFFF, HUD_CENTER, s->name);
             wrapped(530, 160, 20, 1.3f, 34, 0xE0E8F0FF, HUD_LEFT, s->desc);
@@ -853,10 +862,14 @@ void front_draw(void)
         if (!s->n) break;
         fe_level *l = &s->lv[sel_level];
         int unlocked = level_unlocked(l);
+        /* the pictures are read by the I/O thread ahead of time (two levels either way), so stepping through the levels
+         * never waits for the card; a neighbour not read yet shows the empty picture for the moment */
+        for (int k = -2; k <= 2; k++) { fe_level *o = &s->lv[(sel_level + k + 2 * s->n) % s->n]; if (o->img[0]) hud_tex_want(o->img); }
         for (int k = -1; k <= 1; k += 2) {                   /* the neighbours */
             fe_level *o = &s->lv[(sel_level + k + s->n) % s->n];
             float x = 480 + k * 370;
-            hud_image(hud_tex(o->img[0] ? o->img : "levelimage_none"), x - 100, 150, 200, 112, 0xFFFFFF60);
+            unsigned ni = o->img[0] ? hud_tex_ready(o->img) : 0;
+            hud_image(ni ? ni : hud_tex("levelimage_none"), x - 100, 150, 200, 112, 0xFFFFFF60);
         }
         unsigned img = hud_tex(l->img[0] ? l->img : "levelimage_none");
         if (!img) img = hud_tex("levelimage_none");
@@ -944,27 +957,31 @@ void front_draw(void)
         hud_text(HUD_FONT_TITLE, 480, 10, 38, 0xFFFFFFFF, HUD_CENTER, "Controls");
         char b[64];
         for (int i = 0; i < CTL_RESET; i++) {
-            float y = 56 + i * CTL_DY;
+            float y = CTL_Y0 + i * CTL_DY;
             int s = i == sel_ctl;
             hud_rect(130, y, 700, CTL_DY - 3, s ? 0x1E6EA0B0 : 0x10203070);
             unsigned lc = s ? 0xFFFFFFFF : 0xC0D0E0FF;
             if (i < ACT_N) {
                 int dim = i == ACT_TRICK && !S->adv_controls;
-                hud_text(HUD_FONT_MAIN, 148, y + 4, 22, dim ? 0x8090A0FF : lc, HUD_LEFT, ACT_NAME[i]);
+                hud_text(HUD_FONT_MAIN, 148, y + 3, 20, dim ? 0x8090A0FF : lc, HUD_LEFT, ACT_NAME[i]);
                 if (s && ctl_capture) snprintf(b, sizeof b, "Press a button...");
                 else snprintf(b, sizeof b, "%s%c %s%s", s ? "\x19 " : "", btn_icon(S->bind[i]), btn_name(S->bind[i]), s ? " \x1a" : "");
-                hud_text(HUD_FONT_MAIN, 812, y + 4, 22, s && ctl_capture ? 0xFFE070FF : dim ? 0x708090FF : 0x9FE8FFFF, HUD_RIGHT, b);
+                hud_text(HUD_FONT_MAIN, 812, y + 3, 20, s && ctl_capture ? 0xFFE070FF : dim ? 0x708090FF : 0x9FE8FFFF, HUD_RIGHT, b);
             } else if (i == CTL_STICKS) {
-                hud_text(HUD_FONT_MAIN, 148, y + 4, 22, lc, HUD_LEFT, S->adv_controls ? "Steering / Camera" : "Steering / Tricks");
+                hud_text(HUD_FONT_MAIN, 148, y + 3, 20, lc, HUD_LEFT, S->adv_controls ? "Steering / Camera" : "Steering / Tricks");
                 snprintf(b, sizeof b, S->adv_controls ? "%c Steer    %c Camera    \x17\x18\x19\x1a Tricks" : "%c Steer    %c or \x17\x18\x19\x1a Tricks",
                          S->swap_sticks ? HUD_ICON_RSTICK : HUD_ICON_LSTICK, S->swap_sticks ? HUD_ICON_LSTICK : HUD_ICON_RSTICK);
-                hud_text(HUD_FONT_MAIN, 812, y + 4, 22, 0x9FE8FFFF, HUD_RIGHT, b);
+                hud_text(HUD_FONT_MAIN, 812, y + 3, 20, 0x9FE8FFFF, HUD_RIGHT, b);
             } else if (i == CTL_ADV) {
-                hud_text(HUD_FONT_MAIN, 148, y + 4, 22, lc, HUD_LEFT, " Use Advanced Controls");
-                toggle_sz(800, y + 15, 30, S->adv_controls, s);
-            } else {
-                hud_text(HUD_FONT_MAIN, 148, y + 4, 22, lc, HUD_LEFT, " Steering Stick Tricks In The Air");
-                toggle_sz(800, y + 15, 30, S->air_tricks, s);
+                hud_text(HUD_FONT_MAIN, 148, y + 3, 20, lc, HUD_LEFT, " Use Advanced Controls");
+                toggle_sz(800, y + 12, 26, S->adv_controls, s);
+            } else if (i == CTL_AIR) {
+                hud_text(HUD_FONT_MAIN, 148, y + 3, 20, lc, HUD_LEFT, " Steering Stick Tricks In The Air");
+                toggle_sz(800, y + 12, 26, S->air_tricks, s);
+            } else {                                         /* (the camera stick: only with Advanced Controls) */
+                unsigned c2 = S->adv_controls ? lc : 0x8090A0FF;
+                hud_text(HUD_FONT_MAIN, 148, y + 3, 20, c2, HUD_LEFT, i == CTL_CAMX ? " Invert Camera Left / Right" : " Invert Camera Up / Down");
+                toggle_sz(800, y + 12, 26, i == CTL_CAMX ? S->cam_inv_x : S->cam_inv_y, s);
             }
         }
         ui_button(370, 474, 300, 42, "Reset to Defaults", sel_ctl == CTL_RESET, 1);
@@ -973,6 +990,8 @@ void front_draw(void)
         else if (sel_ctl == ACT_TRICK) hint("Advanced Controls: hold it and the steering stick does the tricks (it may share the brake's button)");
         else if (sel_ctl == CTL_ADV) hint("The right stick turns the camera; the Roll button and the steering stick do the tricks");
         else if (sel_ctl == CTL_AIR) hint("In the air with the wings in, the steering stick flips and rolls the car");
+        else if (sel_ctl == CTL_CAMX) hint(S->cam_inv_x ? "Advanced Controls: the camera stick to the right looks left" : "Advanced Controls: the camera stick to the right looks right");
+        else if (sel_ctl == CTL_CAMY) hint(S->cam_inv_y ? "Advanced Controls: the camera stick up raises the camera (it looks down)" : "Advanced Controls: the camera stick up lowers the camera (it looks up)");
         else if (sel_ctl < ACT_N) hint("\x11" " Set     " "\x19" "\x1a" " Change     " "\x12" " Back");
         else hint("\x11" " Select     " "\x12" " Back");
         break; }

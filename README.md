@@ -22,17 +22,18 @@ This is an unofficial fan port. It is not affiliated with DigiPen or Team Nitron
 - Story mode: the tutorial, the six campaign levels with their intro and ending scenes, and the credits drive
 - Arcade: Story, Hardcore and Challenge levels, Stunt mode, the old levels and the community levels that come with
   the PC version (52 levels)
-- Ghost cars (the developers' runs that come with the game, and your own), local high scores with name entry,
-  the 28 achievements and the unlockable cars
+- Ghost cars (the five fastest of the developers' runs that come with the game and your own), local high scores
+  with name entry, the 28 achievements and the unlockable cars
 - Boosting and overheating, jumping, wings and flight, air tricks and their scores, checkpoints
 - The PC version's look: glow and bloom, speed blur, the car materializing at the start and breaking up at the
   finish, tyre tracks, sparks, the wings' light trails, the level objects' animations and lights
 - The music with its interactive layers, the announcer and the sound effects, played from the game's own Wwise
   sound bank
-- Options (HUD, bloom, motion blur, Advanced Controls, inverted flight, volumes) and button remapping. The menus
-  can be used with the touch screen.
+- Options (HUD, bloom, motion blur, Advanced Controls, inverted flight, volumes, dynamic resolution) and button
+  remapping. The menus can be used with the touch screen.
 
-It runs at 60 fps. The heaviest parts of Campaign levels 5 and 6 can drop to about 50 fps.
+It runs at 60 fps. Where the GPU would fall behind, Dynamic Resolution (Options, on by default) draws the 3D scene
+smaller for a moment. A dense cloud of particles right in front of the camera can still drop frames briefly.
 
 Not included: the PC version's online leaderboards (posting results and the online ghosts).
 
@@ -88,13 +89,14 @@ bank) the first time. More details and troubleshooting are in [docs/converter.md
 
 In the air, with the wings folded, the left stick also does tricks (this can be turned off). Every action can be
 moved to another button in Controls, and the steering and trick sticks can be swapped. With **Advanced Controls**
-(Options), holding L in the air makes the left stick do the tricks and the right stick turns the camera, like the
-PC version's advanced scheme.
+(Options), the right stick looks around the car, on the ground and flying (the view eases back behind the car when
+you let go; either direction can be inverted in Controls), and holding L in the air makes the left stick do the
+tricks, like the PC version's advanced scheme.
 
 ## Notes
 
 - Saves, settings, high scores and your ghosts are kept in `ux0:data/nitronic/`, along with a log of the last
-  session (`boot.log`) and the compiled shader cache.
+  session (`boot.log`, which ends at the line `=== the end of this run's log ===`) and the compiled shader cache.
 - The game runs the CPU at 444 MHz, the bus at 222 MHz and the GPU at 222 MHz.
 - A few sounds the PC version makes with a Wwise plug-in (the whoosh of passing tunnel arches and checkpoints)
   are recreated, because the plug-in can't be converted.

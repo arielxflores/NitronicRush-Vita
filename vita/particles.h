@@ -1,8 +1,9 @@
 /* The PC game's particles (graphics 0x609640, ParticleEmitter 0x5f4eb0; docs/re/re_F2.md 4): a pool
  * of camera-facing quads, added onto the scene. Each particle shows one slice of particles.ddsv
  * (here an 8 x 8 atlas of its 64 slices) tinted by a row of particle_color.tga that it walks
- * along as it ages. Used by the weather emitters (snow, ash, smoke) and the car's sparks.
- * The Vita draws fewer of them than the PC (the emitters' rates are scaled down). */
+ * along as it ages. Used by the weather emitters (snow, ash, smoke), the car's sparks, the wing tips'
+ * trails and the exhaust. They live on the GPU (particles.c): written once when made, moved by the
+ * vertex shader. (The weather's rates are scaled down on the Vita.) */
 #ifndef NR_PARTICLES_H
 #define NR_PARTICLES_H
 #include "gfx.h"
@@ -29,8 +30,15 @@ void particles_sparks(const float p[3], const float n[3], float slide, float cou
 /* the same as the PC makes them: (int)(5 x rate) sparks at a contact, rate = min(sliding speed / 3, 15); at most *budget
  * (the frame's allowance, lowered by what was made) */
 void particles_spark_emit(const float p[3], const float n[3], float rate, int *budget);
+int  particles_spark_budget(void);                 /* the sparks allowed a frame */
+/* where the camera is and its pixels per unit at distance 1 (each frame: the sparks' share of the screen) */
+void particles_view(const float eye[3], float ppu);
+/* the particles' clock: first in the frame (as the PC simulates before it emits), not while paused */
 void particles_update(float dt);
 /* hand the quads to gfx (called from gfx's additive pass) */
 void particles_draw(v3 eye, v3 fwd, v3 up);
+void particles_check(int ring, void (*out)(const char *));
+extern const char *particles_dump;          /* (with it: particles_check saves the short-lived window as <it>N.tga) */
+extern int particles_skip;                  /* (the bench: rings not drawn, a bit each - short-lived, long-lived, darkening) */
 int  particles_count(void);
 #endif

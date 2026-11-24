@@ -8,4 +8,6 @@ int vglInitExtended(int legacy_pool_size, int width, int height, int ram_thresho
 void vglSwapBuffers(GLboolean has_commondialog);
 void vglWaitVblankStart(GLboolean enable);
 size_t vglMemFree(int type);
+void vglSetParamBufferSize(uint32_t size);
+void vglUseTripleBuffering(GLboolean usage);
 #endif

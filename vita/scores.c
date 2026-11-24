@@ -93,8 +93,16 @@ void *sc_default_ghost(const char *level, int rank, uint32_t *size)
     return nr_pak_read(PAK, p, size);
 }
 
-/* the tables written this session, kept here: the card may not have them yet (io.c writes them in the background) */
+/* the tables read or written this session, kept here: the card may not have the written ones yet (io.c writes them
+ * in the background), and reading one again would wait for the card */
 static struct { char path[256]; sc_table t; int used; } CACHE[16]; static int ncache_next;
+static void cache_put(const char *path, const sc_table *t)
+{
+    int slot = -1;
+    for (int i = 0; i < 16; i++) if (CACHE[i].used && !strcmp(CACHE[i].path, path)) slot = i;
+    if (slot < 0) { slot = ncache_next; ncache_next = (ncache_next + 1) % 16; }
+    snprintf(CACHE[slot].path, sizeof CACHE[slot].path, "%s", path); CACHE[slot].t = *t; CACHE[slot].used = 1;
+}
 static int read_table(const char *path, sc_table *t)
 {
     for (int i = 0; i < 16; i++) if (CACHE[i].used && !strcmp(CACHE[i].path, path)) { *t = CACHE[i].t; return 0; }
@@ -113,6 +121,7 @@ static int read_table(const char *path, sc_table *t)
         else if (strstr(ln, "</Score>")) e = NULL;
     }
     fclose(f);
+    cache_put(path, t);                                 /* (read once: the next look-ups are from memory) */
     return 0;
 }
 typedef struct { char *b; size_t n, cap; } sbuf;
@@ -132,10 +141,7 @@ static void bp(sbuf *o, const char *fmt, ...)
 }
 static int write_table(const char *path, const sc_table *t, int cat)
 {
-    int slot = -1;
-    for (int i = 0; i < 16; i++) if (CACHE[i].used && !strcmp(CACHE[i].path, path)) slot = i;
-    if (slot < 0) { slot = ncache_next; ncache_next = (ncache_next + 1) % 16; }
-    snprintf(CACHE[slot].path, sizeof CACHE[slot].path, "%s", path); CACHE[slot].t = *t; CACHE[slot].used = 1;
+    cache_put(path, t);
     sbuf o = { 0 }, *f = &o;
     bp(f, "<?xml version=\"1.0\" ?>\r\n<ScoreSet version=\"1\" style=\"%d\" >\r\n", t->style);
     bp(f, "  <String name=\"level_id\" >%s.xml</String>\r\n  <Integer name=\"category\" value=\"%d\" />\r\n", t->level, cat);

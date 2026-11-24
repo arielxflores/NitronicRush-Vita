@@ -28,7 +28,14 @@ static inline float len(v3 a) { return sqrtf(dot(a, a)); }
 static inline v3 norm(v3 a) { float l = len(a); return l > 1e-6f ? mul(a, 1 / l) : v3make(0, 1, 0); }
 static inline v3 lerp3(v3 a, v3 b, float t) { return add(a, mul(sub(b, a), t)); }
 
-typedef struct { GLuint vbo, ibo; uint32_t ni; uint16_t mat, kind; float bmin[3], bmax[3]; } gchunk;
+/* a part of a model drawn with one material. The parts of one material share a vertex and an index buffer (their
+ * group: up to 65536 vertices), each part's indices a range of it, so neighbouring parts in the view are one draw */
+typedef struct { GLuint vbo, ibo; uint32_t ni, ioff; uint16_t mat, kind; int grp; float bmin[3], bmax[3];
+                 uint32_t lni[2], lioff[2]; float lerr[2];   /* lni, lioff, lerr: simpler shapes (lni 0: none), their error (units) */
+                 uint32_t run0, nrun; } gchunk;              /* a big part's runs (level_rt runs; nrun 0: none) */
+/* a run of a big part's triangles, in their order, with its box (a moving object's: in its own space): the runs outside
+ * the view are left out (a part of 40000 triangles - all the vans of a level - drawn for the three in view) */
+typedef struct { uint32_t ioff, ni; float bmin[3], bmax[3]; } grun;
 
 /* one of the level's static lights (from the .nrg), used to light moving objects */
 typedef struct { int type; float pos[3], col[3], amb, near_, far_, axis[3], half, cos_in, cos_out; } gfx_light;
@@ -38,6 +45,8 @@ typedef struct {
     nr_leveldata d;
     GLuint *tex;
     gchunk *ch; uint32_t nch;
+    grun *runs; uint32_t nruns;
+    GLuint *gbuf; uint32_t ngrp;      /* the groups' buffers: vertices, indices (2 a group) */
     float *pathlen;           /* cumulative length along the route */
     float bmin[3], bmax[3];
     gfx_light *lights; int nlights;
@@ -63,10 +72,32 @@ typedef struct { int on; float e[3], r2, r3; } gfx_redblue_t;
 extern gfx_redblue_t gfx_redblue;
 int  gfx_redblue_init(void);                             /* its programs (built once, when a cinematic first loads) */
 
-typedef struct { int no_mips, rgba, no_fog, no_cutout, no_cull, no_tex_cache, discard, no_transfer_wait, cg, no_post, no_bloom, no_wide; } gfx_switches;
+/* the half-precision trial (gfx.c): set gfx_half_trial before gfx_init to have its programs built (the Vita);
+ * gfx_half_use puts them in the game's own programs' place for the bench (0: the game's own again) */
+enum { GFX_HALF_SCROLL = 1, GFX_HALF_SCROLL_READS = 2, GFX_HALF_GLOW = 4, GFX_HALF_FINAL = 8 };
+extern int gfx_half_trial, gfx_half_built;
+extern int gfx_half_final;                 /* the game's final pass in half precision (1, the default; set before gfx_init) */
+extern int gfx_half_all, gfx_half_n, gfx_half_glsl;   /* (the switch file half_all: every fragment shader that can be, in Cg with half-precision colours) */
+extern unsigned gfx_shader_opts;         /* (main.c: the switch file shader_opts; part of the program cache's file names) */
+void gfx_half_use(int what);
+typedef struct { int no_mips, rgba, no_fog, no_cutout, no_cull, no_tex_cache, discard, no_transfer_wait, cg, no_post, no_bloom, no_wide, no_inst, no_lod, no_runs, mip_in_order, tex_ab, tex_check, tex_redo_test; } gfx_switches;
 extern gfx_switches GSW;
+/* set while loading a moving object's model: its parts get simpler shapes (LODs), drawn when they differ from the
+ * full shape by under a quarter of a pixel on screen (small objects far off: thousands of triangles a few pixels wide) */
+extern int gfx_nrl_lod;
+extern uint64_t gfx_tex_us, gfx_tex_ab_us[2]; extern int gfx_tex_n, gfx_tex_ab_n[2], gfx_texchk_n, gfx_texchk_bad;
+extern int gfx_tex_redone, gfx_tex_still_bad;                                       /* (textures given again: vitaGL's copy came out wrong; still wrong after) */
+/* a compressed texture's levels given to vitaGL, checked and given again if its copy came out wrong (gfx.c) */
+int gfx_give_dxt(GLuint id, const char *name, int dxt1, int levelsn, const uint8_t *const lp[], const uint32_t ls[], const int lw[], const int lh[], int in_order, int *bytes);                                   /* (the textures made: the time giving them to the GPU, how many) */
+extern long gfx_lod_tris[3]; extern uint64_t gfx_lod_us;                            /* (the parts given simpler shapes: triangles whole, in the first, in the second) */
 extern int gfx_draws, gfx_tris, gfx_dbg;
+void gfx_bench_restore(void);   /* (the bench: the scrolling glow's textures' mip blending back on, after gfx_dbg 256) */
+#ifdef NR_PC
+extern int gfx_fd_on;       /* (the PC test machine: count the next frame's pixels, by draw) */
+extern char gfx_fd_where[96];   /* (2: one line, FRAGLINE, with this at its start) */
+#endif
 extern int gfx_objs_drawn, gfx_objs_culled;             /* the last frame's objects: drawn, outside the view */
+extern int gfx_inst_draws, gfx_inst_objs;               /* the last frame's instanced draws and the objects in them */
 extern float gfx_prof[8], gfx_prof_sky;              /* [7]: of [0], binding and clearing the scene target; gfx_prof_sky: of [0], the sky */                                /* the last frame's building, ms: sky+culling, level, objects, glow level, glow objects, sprites+particles, screen passes */
 void gfx_prewarm(void);                                  /* every 3D program drawn once per blend state (at load: no first-use hitch later) */
 /* called now and then while a level loads (the loading screen's animation); may draw */
@@ -77,6 +108,9 @@ extern float gfx_T, gfx_ab;                               /* the PC shaders' Tim
 extern float gfx_beat;                                    /* LightPulse: 1 on the music's beat, falling to 0 over 1 s */
 extern float gfx_bloom_tune[4], gfx_bloom_thr;
 extern float gfx_scene_scale;                            /* the 3D scene drawn at this fraction of the screen (0.5..1), scaled up by the final pass */
+extern uint64_t gfx_kick_us; extern float gfx_scale_drawn;   /* (the GPU's clock: see gfx.c) */
+extern int gfx_blur_drawn;
+extern float gfx_lod_bias;                               /* the simpler shapes' allowance x this (the dynamic resolution: 2 while under full size) */
 
 void   gfx_set_log(void (*fn)(const char *fmt, ...));
 int    gfx_init(void);                                    /* 0 = ok */
@@ -92,6 +126,29 @@ float  gfx_texture_mb(void);
 /* camera-facing quads (4 vertices each, level vertex format) onto the scene, added or (subtract)
  * taken away; for the particles, from gfx_hook_additive, which gfx_draw_frame calls in its glow pass */
 void   gfx_quads(const void *verts, int nquads, GLuint tex, int subtract);
+/* the GPU particles (particles.c): one corner of a particle, the same four times but for c */
+typedef struct { float p[4];          /* where it was made (xyz) and when (w, the particles' clock) */
+                 float v[4];          /* velocity, gravity (added to vel.z a second) */
+                 float l[4];          /* 1 / lifetime, half size, rotation, rotation a second */
+                 float t[4];          /* texture slice (w of the 64-slice texture), slices a second, palette row, intensity */
+                 int8_t c[4]; } gfx_pvert;           /* corner (-127 / 127) */
+gfx_pvert *gfx_pring_alloc_vram(uint32_t nverts, unsigned *buf);   /* (the hitch hunt: one in video memory) */
+gfx_pvert *gfx_pring_alloc(uint32_t nverts, unsigned *buf);    /* GPU memory the CPU writes (the Vita); buf: its GL buffer */
+int gfx_pring_renew(gfx_pvert **ring, unsigned *buf, uint32_t nverts);   /* (part_dbg 8192: a new block for it) */
+GLuint gfx_texture_rgba(const void *rgba, int w, int h, int linear);
+/* draw n particles of a ring from 'first' at the particles' clock now (right, up: the camera's), added (subtract: taken off) */
+/* the next gfx_particles draws: shrunk to nothing from near1 in front of the camera to near0, all x size, x inten
+ * brighter (-1e9, 0, 1, 1: as made) */
+void   gfx_particles_scale(float near0, float near1, float size, float inten);
+/* (the switch file "part_dbg", to find the particles' GPU hitches: 1 each draw cut into draws of 256 quads, 4 every quad
+ * of no size (all made and drawn, nothing to see), 32 only the newest quarter of each draw's quads, 64 the rings in
+ * video memory instead of physically contiguous main memory, 128 the rings from their first slots at each level, 256 the
+ * short-lived ring from slot 11098 at each level, 512 only the oldest three quarters of each draw, 1024 a window split
+ * in two by the ring's end: only its first draw, 2048 only its second, 4096 the short-lived window copied to a ring of its
+ * own and drawn from its start) */
+extern int gfx_part_dbg;
+void gfx_ring_watch(const char *where);       /* (the GPU rings' buffer records checked: see gfx.c) */
+void   gfx_particles(const gfx_pvert *ring, unsigned *buf, uint32_t first, uint32_t n, GLuint atlas, GLuint pal, float now, v3 right, v3 up, int subtract, int one_slice, int every);
 extern void (*gfx_hook_additive)(v3 eye, v3 fwd, v3 up);
 /* after the solid objects, before anything glows: things that darken what is under them (the tyre tracks) */
 extern void (*gfx_hook_decal)(v3 eye, v3 fwd, v3 up);

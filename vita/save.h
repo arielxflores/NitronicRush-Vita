@@ -26,6 +26,8 @@ typedef struct {
     unsigned vehicles;                 /* UnlockedVehicles: bit per vehicle (ui/vehicles.txt order) */
     int air_tricks;                    /* Controls: in the air without the wings the steering stick flips and rolls the car
                                         * as the trick stick does (not on the PC; on by default) */
+    int cam_inv_x, cam_inv_y;          /* Controls: the camera stick (Advanced Controls) turned the other way: left / right, up / down
+                                        * (normally up lowers the camera; inverted, up raises it) */
 } save_t;
 
 void        save_defaults(save_t *s);

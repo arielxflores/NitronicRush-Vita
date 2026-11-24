@@ -8,7 +8,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA="$(cd "${1:?data folder}" && pwd)"; OUT="${2:?output folder}"; shift 2
-BIN="${ROOT}/build/nrpc"; [[ -n "${ASAN:-}" ]] && BIN="${ROOT}/build/nrpc_asan" && export ASAN_OPTIONS=detect_leaks=0
+BIN="${NRPC_BIN:-${ROOT}/build/nrpc}"; [[ -n "${ASAN:-}" ]] && BIN="${ROOT}/build/nrpc_asan" && export ASAN_OPTIONS=detect_leaks=0
 [[ -x "${BIN}" ]] || { echo "build it first: make -f Makefile.linux"; exit 1; }
 mkdir -p "${OUT}/data"; OUT="$(cd "${OUT}" && pwd)"
 for f in "${DATA}"/*; do ln -sf "${f}" "${OUT}/data/$(basename "${f}")"; done

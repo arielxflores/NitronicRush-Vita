@@ -21,9 +21,9 @@ static v3 cam_ray(nr_coll *coll, v3 P, v3 off)
     if (L < 1e-4f || !coll || !coll->ntri) return add(P, off);
     v3 d = mul(off, 1.0f / L);
     float o[3] = { P.x, P.y, P.z }, dd[3] = { d.x, d.y, d.z }, t, n[3];
-    uint32_t saved = coll->ndyn; coll->ndyn = 0;
+    coll->no_dyn++;
     int hit = nr_coll_ray(coll, o, dd, L, &t, n, NULL);
-    coll->ndyn = saved;
+    coll->no_dyn--;
     return hit ? add(add(P, mul(d, t)), mul(v3make(n[0], n[1], n[2]), 0.07f)) : add(P, off);
 }
 
@@ -33,6 +33,7 @@ void cam_reset_to(nr_cam *c, const nr_car *car, nr_coll *coll)
     v3 P = v3make(car->pos[0], car->pos[1], car->pos[2]), Y = col(car, 1), Z = col(car, 2);
     c->T = c->W = c->s = 0;
     c->up = Z;
+    c->has_base = 0; c->lyaw = c->lpitch = c->lyaw_v = c->lpitch_v = 0; c->ldist = 1;
     float leash = 6 + c->added + 6 * c->lb, h = 1.2f + 0.7f * c->lb;
     v3 pos = cam_ray(coll, P, add(mul(Y, -leash), mul(Z, h)));
     lookat(c, pos, add(P, mul(Z, 1.2f)), Z);
@@ -42,6 +43,7 @@ void cam_reset_to(nr_cam *c, const nr_car *car, nr_coll *coll)
  * levelling its roll at 3/s, the FOV closing in on the target's spread */
 void cam_track(nr_cam *c, v3 M, float spread, float dt)
 {
+    c->has_base = 0;
     v3 f = mul(c->z, -1), to = sub(M, c->pos);
     float dist = len(to);
     if (dist < 0.01f) return;
@@ -67,11 +69,12 @@ void cam_intro(nr_cam *c, v3 P, const float R[3][3], float T, nr_coll *coll)
     float L = len(off);
     if (L > 1e-4f && coll && coll->ntri) {
         float o[3] = { P.x, P.y, P.z }, d[3] = { off.x / L, off.y / L, off.z / L }, t, n[3];
-        uint32_t saved = coll->ndyn; coll->ndyn = 0;
+        coll->no_dyn++;
         if (nr_coll_ray(coll, o, d, L, &t, n, NULL)) off = mul(off, t / L * 0.99f);
-        coll->ndyn = saved;
+        coll->no_dyn--;
     }
     c->T = c->W = 0; c->up = v3make(0, 0, 1);
+    c->has_base = 0; c->lyaw = c->lpitch = c->lyaw_v = c->lpitch_v = 0; c->ldist = 1;
     lookat(c, add(P, off), add(P, v3make(0, 0, 1.2f)), v3make(0, 0, 1));
 }
 
@@ -92,9 +95,35 @@ static v3 rot_about(v3 v, v3 axis, float a)     /* right-handed Rodrigues (0x676
     float cs = cosf(a), sn = sinf(a);
     return add(add(mul(v, cs), mul(cross(k, v), sn)), mul(k, dot(k, v) * (1 - cs)));
 }
+/* a value eased towards a target as a critically damped spring (smooth both ways, at any frame rate): the time it
+ * takes about st */
+static float smooth_to(float x, float target, float *vel, float st, float dt)
+{
+    float w = 2.0f / st, e = w * dt, f = 1.0f / (1.0f + e + 0.48f * e * e + 0.235f * e * e * e);
+    float d = x - target, t = (*vel + w * d) * dt;
+    *vel = (*vel - w * t) * f;
+    float o = target + (d + t) * f;
+    if ((target - x > 0) == (o > target)) { o = target; *vel = 0; }     /* (no overshoot) */
+    return o;
+}
+void cam_stick_shape(float rx, float ry, float *tx, float *ty)
+{
+    const float DZ = 0.15f;
+    float m = sqrtf(rx * rx + ry * ry);
+    if (m <= DZ) { *tx = *ty = 0; return; }
+    float k = (m > 1 ? 1 : m) - DZ; k /= 1 - DZ;
+    k = k * k * (1.5f - 0.5f * k);                       /* (a gentle start, full at the edge: 0.5 -> 0.31) */
+    *tx = rx / m * k; *ty = -ry / m * k;
+}
+static void free_look(nr_cam *c, nr_coll *coll, v3 P, float tx, float ty, float dt);
 void cam_chase_step(nr_cam *c, const nr_car *car, nr_coll *coll, float dt, float pitch_in, float deploy, int no_speed, float tx, float ty)
 {
     v3 P0 = v3make(car->pos[0], car->pos[1], car->pos[2]), X = col(car, 0), Y = col(car, 1), Z = col(car, 2);
+    /* the chase camera goes on from where it was itself (not where the free look turned the view to), and without the
+     * stick: the PC's CamTurn moved it along the car's own axes (it swung about as the car rolled in the air) and by a
+     * share of the frame (not of the time), and turned it one way on the ground and the other in the air */
+    if (c->has_base) { c->pos = c->bpos; c->x = c->bx; c->y = c->by; c->z = c->bz; }
+    c->tgt = add(P0, mul(Z, 1.2f));
     float r = 2.0f * dt;                                        /* Far and Bumper blend over 0.5 s */
     c->lb = c->far_view ? fminf(1, c->lb + r) : fmaxf(0, c->lb - r);
     c->bb = c->bumper ? fminf(1, c->bb + r) : fmaxf(0, c->bb - r);
@@ -111,7 +140,6 @@ void cam_chase_step(nr_cam *c, const nr_car *car, nr_coll *coll, float dt, float
         float k10 = kf(0.1f, dt);
         v3 CP = sub(C, P); float dist = len(CP);
         v3 D = dist > 1e-4f ? mul(CP, 1.0f / dist) : mul(Y, -1);
-        if (tx != 0 || ty != 0) D = norm(add(sub(D, mul(X, tx * 0.12f)), mul(Z, ty * 0.12f)));    /* FlySens 0.12: the fly camera orbits */
         float d = dist > fly ? fly : dist + (fly - dist) * k10;
         v3 D2 = sub(mul(D, 1 - k10), mul(Y, k10));            /* the fly camera swings in behind */
         float kp = fmaxf(0, fminf(1, 2 - 2 * fabsf(pitch_in)));
@@ -121,8 +149,7 @@ void cam_chase_step(nr_cam *c, const nr_car *car, nr_coll *coll, float dt, float
         else c->up = add(c->up, mul(sub(v3make(0, 0, 1), c->up), kf(0.03f, dt)));
         v3 up = c->up;
         v3 v2 = sub(P, C);
-        float hgt = h + 3 * ty;                                   /* CamTurn: up/down raises the camera, turns it round the car */
-        if (tx != 0 || ty != 0) v2 = rot_about(rot_about(v2, up, 0.5f * tx * leash * dt), c->x, -0.3f * ty * leash * dt);
+        float hgt = h;
         v3 flat = sub(v2, mul(up, dot(up, v2)));
         if (dot(v, v) > 1 && len(flat) > 1e-4f) {              /* swing round when the car drives at the camera */
             v3 nv = sub(v, mul(up, dot(up, v)));
@@ -144,18 +171,54 @@ void cam_chase_step(nr_cam *c, const nr_car *car, nr_coll *coll, float dt, float
         v3 tumble = mul(n, -L2);
         v3 off = add(mul(add(mul(ground, 1 - c->T), mul(tumble, c->T)), 1 - c->W), mul(D2, c->W * d));
         v3 pos = cam_ray(coll, P, off);
-        lookat(c, pos, add(P, mul(up, 1.2f * ratio * (1 - c->W))), add(mul(up, 1 - c->W), mul(Uf, c->W)));
+        c->tgt = add(P, mul(up, 1.2f * ratio * (1 - c->W)));
+        lookat(c, pos, c->tgt, add(mul(up, 1 - c->W), mul(Uf, c->W)));
     }
     if (c->bb > 0) {                                           /* Bumper: on the car's nose, turned as the car */
         v3 H = add(P0, add(mul(X, c->bump[0]), add(mul(Y, c->bump[1]), mul(Z, c->bump[2]))));
         c->pos = lerp3(c->pos, H, c->bb);
         v3 f = norm(lerp3(mul(c->z, -1), Y, c->bb)), u = norm(lerp3(c->y, Z, c->bb));
         lookat(c, c->pos, add(c->pos, f), u);
+        c->tgt = lerp3(c->tgt, c->pos, c->bb);                   /* (the bumper view turns where it is) */
     }
+    c->bpos = c->pos; c->bx = c->x; c->by = c->y; c->bz = c->z; c->has_base = 1;
+    free_look(c, coll, add(P0, mul(Y, 5 * c->bb)), tx, ty, dt);
     /* SpeedFov: speed^2 from 4000 to 7000, in over 0.5 s, out over 0.25 s; FOV 60..75 (also the speed blur) */
     float q = car->vel[0] * car->vel[0] + car->vel[1] * car->vel[1] + car->vel[2] * car->vel[2];
     float t = no_speed ? 0 : q <= 4000 ? 0 : q >= 7000 ? 1 : (q - 4000) / 3000;
     float a = dt / (t > c->s ? 0.5f : 0.25f); if (a > 1) a = 1;
     c->s += (t - c->s) * a;
     c->fov = 60 + 15 * c->s;
+}
+
+/* the free look: the stick's direction is where the view turns to (all the way: 120 degrees round; the camera 40
+ * degrees up, and down 12 on the ground, 35 flying), reached as a damped spring in about 0.15 s and eased back behind the car a little slower
+ * (0.22 s) when the stick is let go. The chase camera's own frame is turned as one round what it looks at (about its
+ * up, then its right), so it never rolls or flips however the car turns; a wall between what it looks at and the
+ * camera pulls it in at once, and it eases back out */
+static void free_look(nr_cam *c, nr_coll *coll, v3 P, float tx, float ty, float dt)
+{
+    (void)P;
+    const float YAW = 2.094f, UP = 0.698f, DOWN = 0.21f + 0.40f * c->W;
+    float ty_ = ty * (ty > 0 ? UP : DOWN), tyaw = tx * YAW;
+    c->lyaw = smooth_to(c->lyaw, tyaw, &c->lyaw_v, fabsf(tyaw) < fabsf(c->lyaw) ? 0.22f : 0.15f, dt);
+    c->lpitch = smooth_to(c->lpitch, ty_, &c->lpitch_v, fabsf(ty_) < fabsf(c->lpitch) ? 0.22f : 0.15f, dt);
+    if (fabsf(c->lyaw) < 1e-4f && fabsf(c->lpitch) < 1e-4f) { c->lyaw = c->lpitch = c->lyaw_v = c->lpitch_v = 0; c->ldist = 1; return; }
+    v3 pv = c->tgt, o = sub(c->pos, pv);
+    v3 x = c->x, y = c->y, z = c->z;
+    /* down first (about the camera's right: the view tips down as the camera rises), then round (about its up) */
+    o = rot_about(o, x, -c->lpitch); y = rot_about(y, x, -c->lpitch); z = rot_about(z, x, -c->lpitch);
+    o = rot_about(o, c->y, -c->lyaw); x = rot_about(x, c->y, -c->lyaw); y = rot_about(y, c->y, -c->lyaw); z = rot_about(z, c->y, -c->lyaw);
+    float L = len(o), f = 1;
+    if (L > 0.3f && coll && coll->ntri) {                /* a wall between what it looks at and the turned camera */
+        v3 d = mul(o, 1.0f / L);
+        float org[3] = { pv.x, pv.y, pv.z }, dd[3] = { d.x, d.y, d.z }, t, n[3];
+        coll->no_dyn++;
+        if (nr_coll_ray(coll, org, dd, L, &t, n, NULL)) f = fmaxf(0, t - 0.15f) / L;
+        coll->no_dyn--;
+    }
+    c->ldist = f < c->ldist ? f : c->ldist + (f - c->ldist) * fminf(1, 6 * dt);   /* (in at once, out over about 0.3 s) */
+    v3 pos = add(pv, mul(o, c->ldist));
+    if (L * c->ldist > 0.5f) lookat(c, pos, pv, y);
+    else { c->pos = pos; c->x = x; c->y = y; c->z = z; }    /* (the bumper view: turned where it is) */
 }

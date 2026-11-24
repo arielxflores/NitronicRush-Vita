@@ -7,11 +7,13 @@ The port as a whole is distributed under the GNU GPL v3 (see `LICENSE`). It cont
 | Library | Where | Author | License |
 | --- | --- | --- | --- |
 | [stb_vorbis](https://github.com/nothings/stb) | `vita/third_party/stb_vorbis.c` | Sean Barrett | MIT or public domain |
-| [tinf](https://github.com/jibsen/tinf) (inflate) | `src/tinf/` | Joergen Ibsen | zlib |
+| [libdeflate](https://github.com/ebiggers/libdeflate) 1.24 (its decompressor: the data packs) | `src/libdeflate/` | Eric Biggers | MIT |
+| [tinf](https://github.com/jibsen/tinf) (inflate, kept as a fallback) | `src/tinf/` | Joergen Ibsen | zlib |
+| [meshoptimizer](https://github.com/zeux/meshoptimizer) 0.22 (its simplifier) | `vita/third_party/meshoptimizer/` | Arseny Kapoulkine | MIT |
 | [ww2ogg](https://github.com/hcs64/ww2ogg) | `converter/third_party/ww2ogg/` | Adam Gashlin (hcs), Xiph.org Foundation | BSD 3-Clause |
 
-The license text of each is kept with its files (`src/tinf/LICENSE`, `converter/third_party/ww2ogg/COPYING`, the
-end of `stb_vorbis.c`).
+The license text of each is kept with its files (`src/libdeflate/COPYING`, `src/tinf/LICENSE`, `vita/third_party/meshoptimizer/LICENSE.md`,
+`converter/third_party/ww2ogg/COPYING`, the end of `stb_vorbis.c`).
 
 ## Linked (Vita build)
 

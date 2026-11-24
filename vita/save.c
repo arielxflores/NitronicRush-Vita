@@ -49,6 +49,7 @@ int save_load(save_t *s, const char *path)
             else if (!strcmp(k, "adv_controls")) s->adv_controls = (int)v; else if (!strcmp(k, "announcer")) s->announcer = v;
             else if (!strcmp(k, "vehicles")) s->vehicles = (unsigned)v;
             else if (!strcmp(k, "air_tricks")) s->air_tricks = (int)v;
+            else if (!strcmp(k, "cam_invert_x")) s->cam_inv_x = (int)v; else if (!strcmp(k, "cam_invert_updown")) s->cam_inv_y = (int)v;   /* (not "cam_invert_y": up and down swapped meaning) */
         } else if (sscanf(ln, "bind %d %d", &a, &b) == 2) {
             if (a >= 0 && a < ACT_N && b >= 0 && b < BTN_N) s->bind[a] = b;
         } else if (sscanf(ln, "bindv %d", &a) == 1) {
@@ -116,7 +117,7 @@ int save_write(const save_t *s, const char *path)
     bp(f, "stat streetlights %d\nstat screens %d\nstat most_screens %d\nstat barrel_rolls %d\nstat wall_dist %.4f\nstat ceil_dist %.4f\n",
             s->streetlights, s->screens, s->most_screens, s->barrel_rolls, s->wall_dist, s->ceil_dist);
     bp(f, "opt bloom %d\nopt motion_blur %d\nopt adv_controls %d\nopt announcer %.3f\nopt vehicles %u\n", s->bloom, s->motion_blur, s->adv_controls, s->announcer, s->vehicles);
-    bp(f, "opt air_tricks %d\n", s->air_tricks);
+    bp(f, "opt air_tricks %d\nopt cam_invert_x %d\nopt cam_invert_updown %d\n", s->air_tricks, s->cam_inv_x, s->cam_inv_y);
     if (!o.b) return -1;
     io_write_take(path, o.b, o.n);
     return 0;

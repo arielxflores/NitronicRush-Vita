@@ -30,6 +30,7 @@
  *   warp N | finish     put the car at checkpoint N (0 = the first) or at the finish
  *   frametime MS        each frame with vsync takes MS of game time (a slow Vita: the dynamic resolution)
  *   post EVENT          posts a sound event (object 0)
+ *   flip                turns the car over onto its roof (0.8 above where it is, its speed kept): a roof slide
  *   BTN: cross circle square triangle l r up down left right start select */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -65,6 +66,13 @@ SceUInt64 sceKernelGetProcessTimeWide(void)
     if (real_clock) return real_us() - r0;
     if (vsync || det_clock) return vbase + (calls < 999 ? ++calls : calls);
     return vbase + (real_us() - rbase);
+}
+/* the clock as it reads now, without moving it on: the log's times (a line logged or not - the timing logs are by the
+ * test machine's own speed - would otherwise change the game's next frame time by a microsecond: runs would not repeat) */
+uint64_t nrpc_clock_peek(void)
+{
+    if (real_clock || !(vsync || det_clock)) return sceKernelGetProcessTimeWide();
+    return vbase + calls;
 }
 static void clock_rebase(void) { vbase = sceKernelGetProcessTimeWide(); rbase = real_us(); calls = 0; }
 static double vt(void) { return sceKernelGetProcessTimeWide() / 1e6; }
@@ -108,6 +116,8 @@ int sceKernelChangeThreadCpuAffinityMask(int thid, int mask) { (void)thid; (void
 int sceIoMkdir(const char *dir, int mode) { return mkdir(dir, mode); }
 int sceIoGetstat(const char *file, SceIoStat *st) { struct stat s; if (stat(file, &s)) return -1; if (st) st->st_size = s.st_size; return 0; }
 size_t vglMemFree(int type) { (void)type; return 100u << 20; }
+void vglSetParamBufferSize(uint32_t size) { (void)size; }
+void vglUseTripleBuffering(GLboolean usage) { (void)usage; }
 void vglWaitVblankStart(GLboolean enable) { if ((enable != 0) != vsync) { clock_rebase(); vsync = enable != 0; } }
 
 /* ------------------------------------------------------------------ sound: mixed in step with the clock */
@@ -219,6 +229,7 @@ static void run_cmd(char *c)
     else if (!strcmp(a, "frametime")) { double ms = atof(b); frame_us = (uint64_t)((ms > 1 ? ms : 16.667) * 1000); }
     else if (!strcmp(a, "warp")) { extern int nrpc_warp; nrpc_warp = !strcmp(b, "finish") ? 999 : atoi(b); }
     else if (!strcmp(a, "wreck")) { extern int nrpc_wreck; nrpc_wreck = 1; }
+    else if (!strcmp(a, "flip")) { extern int nrpc_flip; nrpc_flip = 1; }      /* the car onto its roof, 0.8 up, its speed kept */
     else if (!strcmp(a, "tap")) { touch_x = (float)atof(b); touch_y = (float)atof(d); touch_on = 1; tap_left = 3; }
     else if (!strcmp(a, "touch")) { touch_x = (float)atof(b); touch_y = (float)atof(d); touch_on = 1; tap_left = 0; }
     else if (!strcmp(a, "untouch")) { touch_on = 0; tap_left = 0; }
@@ -353,4 +364,42 @@ __attribute__((constructor)) static void nrpc_start(void)
     if (getenv("NRPC_FRAMES")) { frames_csv = fopen(getenv("NRPC_FRAMES"), "w"); if (frames_csv) fprintf(frames_csv, "frame,t,pc_ms,luma,rms,peak,vsync\n"); }
     if (getenv("NRPC_MAXT")) maxt = atof(getenv("NRPC_MAXT"));
     signal(SIGSEGV, on_crash); signal(SIGABRT, on_crash); signal(SIGFPE, on_crash); signal(SIGBUS, on_crash);
+}
+
+/* ---- GLBUFCHECK (see pc_gl.h): the game's buffer names followed. With it the names are never given back (no real
+ * delete: a name made again would hide its stale uses), and each misuse is reported once a place (stderr, GLBUF) */
+#undef glGenBuffers
+#undef glDeleteBuffers
+#undef glBindBuffer
+#define GLB_MAX (1 << 20)
+static uint8_t *glb_state; static int glb_on = -1;
+static void glb_init(void) { if (glb_on < 0) { glb_on = getenv("GLBUFCHECK") != NULL; if (glb_on) glb_state = calloc(GLB_MAX, 1); } }
+static void glb_say(const char *what, GLuint b, const char *f, int l)
+{
+    static char seen[64][96]; static int ns; char k[96]; snprintf(k, sizeof k, "%s %s:%d", what, f, l);
+    for (int i = 0; i < ns; i++) if (!strcmp(seen[i], k)) return;
+    if (ns < 64) snprintf(seen[ns++], sizeof seen[0], "%s", k);
+    fprintf(stderr, "GLBUF %s: buffer %u at %s:%d\n", what, b, f, l);
+}
+void nrpc_gen_buffers(GLsizei n, GLuint *b, const char *f, int l)
+{
+    glb_init(); glGenBuffers(n, b);
+    if (glb_on) for (GLsizei i = 0; i < n; i++) if (b[i] < GLB_MAX) { if (glb_state[b[i]]) glb_say("a name given again", b[i], f, l); glb_state[b[i]] = 1; }
+}
+void nrpc_del_buffers(GLsizei n, const GLuint *b, const char *f, int l)
+{
+    glb_init();
+    if (!glb_on) { glDeleteBuffers(n, b); return; }
+    for (GLsizei i = 0; i < n; i++) {
+        if (!b[i] || b[i] >= GLB_MAX) continue;
+        if (glb_state[b[i]] == 2) glb_say("deleted twice", b[i], f, l);
+        else if (glb_state[b[i]] == 0) glb_say("deleted, never made", b[i], f, l);
+        glb_state[b[i]] = 2;
+    }
+}
+void nrpc_bind_buffer(GLenum t, GLuint b, const char *f, int l)
+{
+    glb_init();
+    if (glb_on && b && b < GLB_MAX && glb_state[b] != 1) glb_say(glb_state[b] == 2 ? "bound after its deletion" : "bound, never made", b, f, l);
+    glBindBuffer(t, b);
 }

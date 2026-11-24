@@ -3,6 +3,17 @@
 #define PC_GL_H
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+/* (the switch GLBUFCHECK: every buffer name the game makes, binds and deletes followed - vitaGL's names are pointers to
+ * records in the heap, so deleting one twice, or binding or drawing with one after its deletion, reads or frees memory
+ * that may be another's by then: tools/pc/nrpc.c reports each) */
+#ifndef NRPC_NO_GLWRAP
+void nrpc_gen_buffers(GLsizei n, GLuint *b, const char *f, int l);
+void nrpc_del_buffers(GLsizei n, const GLuint *b, const char *f, int l);
+void nrpc_bind_buffer(GLenum t, GLuint b, const char *f, int l);
+#define glGenBuffers(n, b) nrpc_gen_buffers(n, b, __FILE__, __LINE__)
+#define glDeleteBuffers(n, b) nrpc_del_buffers(n, b, __FILE__, __LINE__)
+#define glBindBuffer(t, b) nrpc_bind_buffer(t, b, __FILE__, __LINE__)
+#endif
 #ifndef GL_DEPTH24_STENCIL8
 #define GL_DEPTH24_STENCIL8 0x88F0
 #endif

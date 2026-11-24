@@ -29,9 +29,19 @@ const char *snd_event_name(uint32_t id);
 void     snd_stats(int *voices, int *decoding, float *load);
 void     snd_peak(float *peak, int *late);
 void     snd_peak_sec(float *peak, int *late);   /* the same, kept apart (the credits' second-by-second log) */
+void     snd_peak_lv(float *peak, int *late);    /* the same again (autoplay: a level's) */
+int      snd_bench(const char *rec, const char *wav_path, void (*out)(const char *));   /* the mixer replaying a recording, timed (snd.c) */
 void     snd_prof(char *b, size_t n);   /* the mixer's time in opening, seeking and decoding streams since the last call */   /* the mixer's worst buffer (x its time slot) and late buffers since the last call */
 void     snd_cores(int *mixer, int *loader);   /* the cores the mixer and the file loader run on (-1: not running) */
 /* PC tools: render frames of stereo 16-bit audio (no thread) */
 void     snd_render(int16_t *out, int frames);
 void     snd_debug_dump(void (*out)(const char *));
+/* the events posted (the game's thread): every one as it goes, to this (the switch file snd_evlog; NULL: none); and
+ * counted - snd_ev_report writes the most posted since the last report (a line), then starts again */
+extern void (*snd_evlog)(const char *);
+int      snd_ev_report(void (*out)(const char *), const char *what, int top, int scope);   /* (scope 0 or 1: two counts kept apart) */
+#ifdef NR_PC
+int      snd_obj_voices(int obj, float *loudest_db);   /* (the test machine: voices on an object, the loudest's gain) */
+#endif
+void snd_limiter_lv(float *min_db, float *held_ms);   /* the output limiter in the level so far: lowest gain, time held down */
 #endif

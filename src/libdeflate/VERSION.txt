@@ -1,0 +1,1 @@
+libdeflate v1.24 (github.com/ebiggers/libdeflate): the decompressor only

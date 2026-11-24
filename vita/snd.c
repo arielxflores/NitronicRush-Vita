@@ -96,6 +96,10 @@ typedef struct {
                                    * the Vita 10-30 ms) and not used yet: the first voice takes it */
     volatile int repark;          /* a voice took the parked decoder: the media thread opens the next one (set by
                                    * the mixer, cleared by the media thread when the new one is in place) */
+    /* a long file played by two voices or more at once (the Evil Carwash's six fans): decoded to PCM once by the media
+     * thread, then every voice reads that instead of decoding its own copy */
+    int16_t *volatile promo; uint32_t promo_frames, promo_bytes; int promo_ch;
+    volatile int promo_state;     /* 0 not asked, 1 asked (the media thread decoding), 2 done (or not possible) */
 } MediaLoc;
 enum { M_NONE, M_LOADING, M_READY, M_FAILED };
 static MediaLoc *g_mloc;
@@ -107,7 +111,27 @@ uint32_t snd_hash(const char *s)
     for (; *s; s++) { unsigned char c = (unsigned char)*s; if (c >= 'A' && c <= 'Z') c += 32; h = (h * 16777619u) ^ c; }
     return h;
 }
-static float db2lin(float db) { return db <= -96.0f ? 0.0f : powf(10.0f, db * 0.05f); }
+/* 2^x and log2 x for the mixer's gains and pitches (newlib's powf / log10f cost the Vita ~1 us each, and every voice
+ * took several a block): 2^x to 2e-7 (a pitched sound drifts 0.01 sample a second from powf's), log2 to 2e-5 */
+static inline float fexp2(float x)
+{
+    if (x < -126.0f) return 0.0f;
+    if (x > 126.0f) x = 126.0f;
+    int i = (int)(x + (x >= 0 ? 0.5f : -0.5f));         /* nearest: the rest within +-0.5, where the series is good to 1e-7 */
+    float f = (x - (float)i) * 0.69314718f;
+    float q = 1.0f + f * (1.0f + f * (0.5f + f * (0.16666667f + f * (0.041666667f + f * (0.0083333333f + f * 0.0013888889f)))));
+    union { float f; int32_t i; } u; u.f = q; u.i += (int32_t)((uint32_t)i << 23);
+    return u.f;
+}
+static inline float flog2(float x)
+{
+    union { float f; int32_t i; } u; u.f = x;
+    float e = (float)(((u.i >> 23) & 255) - 127);
+    u.i = (u.i & 0x7FFFFF) | (127 << 23);               /* the mantissa, 1..2 */
+    float y = (u.f - 1.0f) / (u.f + 1.0f), y2 = y * y;  /* log2 m = 2/ln2 (y + y^3/3 + y^5/5 + y^7/7) */
+    return e + 2.8853901f * y * (1.0f + y2 * (0.33333333f + y2 * (0.2f + y2 * 0.14285714f)));
+}
+static float db2lin(float db) { return db <= -96.0f ? 0.0f : fexp2(db * 0.16609640f); }
 static float frand(void) { static uint32_t s = 0x1234567; s = s * 1664525u + 1013904223u; return (s >> 8) * (1.0f / 16777216.0f); }
 
 static float shape(int type, float t)
@@ -126,28 +150,32 @@ static float shape(int type, float t)
     default: return t;                                        /* Linear */
     }
 }
+static float *g_cx, *g_cy; static uint8_t *g_cv;     /* each curve's last x and its value (most voices ask the same) */
 static float curve_eval(int c, float x)
 {
     if (c < 0 || (uint32_t)c >= B.n_curves) return 0;
+    if (g_cv && g_cv[c] && g_cx[c] == x) return g_cy[c];
     const N_Curve *cv = &B.curves[c]; const N_Point *p = &B.points[cv->first];
     if (!cv->n) return 0;
-    if (x <= p[0].x) return p[0].y;
-    for (uint32_t i = 0; i + 1 < cv->n; i++) {
+    float y = p[cv->n - 1].y;
+    if (x <= p[0].x) y = p[0].y;
+    else for (uint32_t i = 0; i + 1 < cv->n; i++) {
         if (x <= p[i + 1].x) {
             float w = p[i + 1].x - p[i].x, t = w > 0 ? (x - p[i].x) / w : 1;
             float k = shape(p[i].interp, t);
             if (cv->scaling == 2) {            /* dB curves interpolate in amplitude, like Wwise */
                 float a = db2lin(p[i].y), b = db2lin(p[i + 1].y), l = a + (b - a) * k;
-                return l > 0.0000153f ? 20.0f * log10f(l) : -96.3f;
-            }
-            return p[i].y + (p[i + 1].y - p[i].y) * k;
+                y = l > 0.0000153f ? 6.0205999f * flog2(l) : -96.3f;
+            } else y = p[i].y + (p[i + 1].y - p[i].y) * k;
+            break;
         }
     }
-    return p[cv->n - 1].y;
+    if (g_cv) { g_cv[c] = 1; g_cx[c] = x; g_cy[c] = y; }
+    return y;
 }
 
 /* ------------------------------------------------------------------ runtime state */
-#define MAXV 64
+#define MAXV 96
 #define MAXP 24
 #define MAXD 64
 #define BLOCK 256
@@ -164,6 +192,18 @@ static float ramp_at(const Ramp *r, int64_t now)
 static void ramp_set(Ramp *r, float from, float to, int64_t now, float ms, int curve)
 {
     r->from = from; r->to = to; r->t0 = now; r->dur = (int64_t)(ms * (SND_RATE / 1000.0f)); r->curve = (uint8_t)curve; r->active = 1;
+}
+/* a stop: from where it is now down to nothing over ms. One already on its way out keeps the fade it has, unless this
+ * one would end sooner. (Each stop used to start the fade again from where it had got to: a stop posted again and again
+ * - the car grazing a wall, the scrape's Play and Stop every frame or two - kept every copy fading and none finished,
+ * each stop taking off only a fifth of what was left; End to a Violent Heart's walls piled up 40 scrapes, 80 voices,
+ * heard as static, with the mixer at 137% of real time. Wwise lets a fade-out run out in its time: at most a few
+ * scrapes over each other, 150 ms each) */
+static void ramp_stop(Ramp *r, int *stopping, int64_t now, float ms, int curve)
+{
+    if (*stopping && r->to == 0 && r->t0 + r->dur <= now + (int64_t)(ms * (SND_RATE / 1000.0f))) return;
+    *stopping = 1;
+    ramp_set(r, ramp_at(r, now), 0, now, ms, curve);
 }
 
 typedef struct {
@@ -184,6 +224,9 @@ typedef struct {
     int noise; uint32_t nseed; float nf1, nf2;    /* synthesised woosh (SoundSeed plug-in sources) */
     int route;                 /* R_* bits: the busses it goes through that have state or effects here */
     int quiet;                 /* samples it has been silent while its decoder was kept in step */
+    uint32_t pcm_frames;       /* (a voice playing decoded PCM: its length) */
+    float last_g, last_step, last_lpf, last_pl, last_pr;   /* the gain worked out last (a silent voice: every 4th block) */
+    uint8_t gain_known, skip;
 #ifdef NR_PC
     float dbg[2][2]; int dbg_n; float dbg_max; int64_t dbg_at;   /* (the test machine, SND_CLICKLOG: its own output's jumps) */
 #endif
@@ -225,10 +268,11 @@ static int64_t g_now;
 static float   g_lis_pos[3], g_lis_fwd[3] = {0, 1, 0}, g_lis_up[3] = {0, 0, 1};
 static int     g_ready;
 static nr_pak *g_pak;
-static float   g_load, g_peak; static int g_stat_voices, g_stat_dec, g_late;
-static float   g_peak1; static int g_late1;     /* the same, for snd_peak_sec's own reader */
+static float   g_load, g_peak; static int g_stat_voices, g_stat_dec, g_stat_vorb, g_late;
+static float   g_peak1, g_peak2; static int g_late1, g_late2;     /* the same, for snd_peak_sec's and snd_peak_lv's own readers */
 /* where the mixer's time goes, for the log: opening Vorbis streams, seeking in them, decoding */
 static uint64_t pf_open, pf_seek, pf_dec; static uint32_t pf_open_n, pf_seek_n, pf_open_max, pf_seek_max, pf_dec_max;
+static volatile uint32_t pf_promo;          /* shared files decoded to PCM (the media thread counts) */
 static uint64_t snd_us(void);
 
 /* the Init.bnk busses done here (see the top) */
@@ -243,13 +287,14 @@ typedef struct { int type; uint32_t id; int obj; float v[9]; } Cmd;
 #define QN 512
 static Cmd Q[QN];
 static volatile uint32_t q_head, q_tail;
-static void push_cmd(const Cmd *c)
+static int push_cmd(const Cmd *c)
 {
     uint32_t h = __atomic_load_n(&q_head, __ATOMIC_RELAXED);
     uint32_t t = __atomic_load_n(&q_tail, __ATOMIC_ACQUIRE);
-    if (h - t >= QN) return;                    /* full: drop */
+    if (h - t >= QN) return 0;                  /* full: drop */
     Q[h % QN] = *c;
     __atomic_store_n(&q_head, h + 1, __ATOMIC_RELEASE);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ lookup */
@@ -302,6 +347,7 @@ static uint32_t g_use_clock;
 static volatile int g_mem_bytes;
 #define MEM_MAX (56u << 20)
 #define PCM_FILE_MAX (112u << 10)
+#define PROMO_MAX (10u << 20)         /* (the most PCM a shared file is decoded to: the Evil Carwash's fans' loop is 4.2 MB) */
 #define RQN 256
 static int RQ[RQN]; static volatile uint32_t rq_head, rq_tail;
 #ifdef __vita__
@@ -342,14 +388,34 @@ static void media_repark(int i)       /* media thread: the next voice's decoder 
     }
     __atomic_store_n(&m->repark, 0, __ATOMIC_RELEASE);
 }
+static uint64_t pf_media;      /* (the benchmark: time in the file loader, which runs inside the mixer there) */
+static int g_bprof; static uint64_t pf_gain;   /* (the benchmark: the time working out the voices' gains) */
+static void media_promote(int i)    /* media thread */
+{
+    MediaLoc *m = &g_mloc[i];
+    int16_t *out = NULL; int ch = 0, rate = 0, n = 0;
+    if (__atomic_load_n(&m->state, __ATOMIC_ACQUIRE) == M_READY && m->mem && !m->promo)
+        n = stb_vorbis_decode_memory(m->mem, (int)m->size, &ch, &rate, &out);
+    if (n > 0 && out && ch > 0) {
+        if (ch > 2) { for (int k = 0; k < n; k++) { out[k * 2] = out[k * ch]; out[k * 2 + 1] = out[k * ch + 1]; } ch = 2; }
+        m->promo_frames = (uint32_t)n; m->promo_ch = ch; m->promo_bytes = (uint32_t)n * ch * 2;
+        __atomic_add_fetch(&g_mem_bytes, (int)m->promo_bytes, __ATOMIC_RELAXED);
+        __atomic_store_n(&m->promo, out, __ATOMIC_RELEASE);
+        pf_promo++;
+    } else free(out);
+    __atomic_store_n(&m->promo_state, 2, __ATOMIC_RELEASE);
+}
 static void media_work(void)
 {
+    uint64_t t0_ = snd_us();
     while (rq_tail != __atomic_load_n(&rq_head, __ATOMIC_ACQUIRE)) {
         int i = RQ[rq_tail % RQN];
         if (i < 0) { media_repark(i & 0x7fffffff); __atomic_store_n(&rq_tail, rq_tail + 1, __ATOMIC_RELEASE); continue; }
+        if (i & 0x40000000) { media_promote(i & 0x3fffffff); __atomic_store_n(&rq_tail, rq_tail + 1, __ATOMIC_RELEASE); continue; }
         media_load(i);
         __atomic_store_n(&rq_tail, rq_tail + 1, __ATOMIC_RELEASE);
     }
+    pf_media += snd_us() - t0_;
 }
 static void media_request(int i)       /* mixer thread */
 {
@@ -381,12 +447,28 @@ static void media_request_repark(int i)    /* mixer thread */
     media_work();
 #endif
 }
+static void media_request_promo(int i)     /* mixer thread */
+{
+    MediaLoc *m = &g_mloc[i];
+    if (m->promo_state) return;
+    uint32_t h = rq_head;
+    if (h - __atomic_load_n(&rq_tail, __ATOMIC_ACQUIRE) >= RQN) return;
+    __atomic_store_n(&m->promo_state, 1, __ATOMIC_RELEASE);
+    RQ[h % RQN] = (int)((unsigned)i | 0x40000000u);
+    __atomic_store_n(&rq_head, h + 1, __ATOMIC_RELEASE);
+#ifdef __vita__
+    if (g_media_sema >= 0) sceKernelSignalSema(g_media_sema, 1); else media_work();
+#else
+    media_work();
+#endif
+}
 static void media_trim(void)           /* mixer thread */
 {
     while (__atomic_load_n(&g_mem_bytes, __ATOMIC_RELAXED) > (int)MEM_MAX) {
         int best = -1; uint32_t bt = 0xFFFFFFFF;
         for (uint32_t i = 0; i < B.n_media; i++)          /* (not one used in the last moments: a voice may be about to open it) */
             if (g_mloc[i].state == M_READY && !g_mloc[i].users && !__atomic_load_n(&g_mloc[i].repark, __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&g_mloc[i].promo_state, __ATOMIC_ACQUIRE) != 1 &&
                 g_mloc[i].last_use < bt && g_use_clock - g_mloc[i].last_use > 64) { bt = g_mloc[i].last_use; best = (int)i; }
         if (best < 0) break;
         MediaLoc *m = &g_mloc[best];
@@ -394,6 +476,8 @@ static void media_trim(void)           /* mixer thread */
         if (pk) stb_vorbis_close(pk);
         free(m->mem); free(m->pcm); m->mem = NULL; m->pcm = NULL;
         __atomic_sub_fetch(&g_mem_bytes, (int)m->bytes, __ATOMIC_RELAXED);
+        if (m->promo) { __atomic_sub_fetch(&g_mem_bytes, (int)m->promo_bytes, __ATOMIC_RELAXED); free(m->promo); m->promo = NULL; }
+        m->promo_state = 0;
         m->state = M_NONE;
     }
 }
@@ -413,7 +497,9 @@ static int voice_open(Voice *v)
         media_request(v->media); return 1;
     }
     m->last_use = ++g_use_clock; m->users++;
-    if (m->pcm) { v->pcm = m->pcm; v->ch = m->pcm_ch; }
+    int16_t *pr = __atomic_load_n(&m->promo, __ATOMIC_ACQUIRE);
+    if (m->pcm) { v->pcm = m->pcm; v->ch = m->pcm_ch; v->pcm_frames = m->pcm_frames; }
+    else if (pr) { v->pcm = pr; v->ch = m->promo_ch; v->pcm_frames = m->promo_frames; }
     else {
         v->vb = __atomic_exchange_n(&m->parked, NULL, __ATOMIC_ACQ_REL);
         if (v->vb) media_request_repark(v->media);     /* (the media thread opens the next voice's now) */
@@ -428,6 +514,10 @@ static int voice_open(Voice *v)
         if (!v->vb) { m->users--; return -1; }
         v->fresh = 1;
         v->ch = stb_vorbis_get_info(v->vb).channels; if (v->ch > 2) v->ch = 2;
+        /* decoded to PCM by the file thread meanwhile (up to 10 MB: not the long music layers), so it is decoded once: the
+         * voices playing it switch to that copy, and the mixer's core no longer decodes it (each stream decoding cost the
+         * Vita's mixer ~5% of its core) */
+        if (!m->promo_state && (uint64_t)B.media[v->media].samples * v->ch * 2 <= PROMO_MAX) media_request_promo(v->media);
     }
     v->opened = 1;
     if (!v->buf) v->buf = malloc(sizeof(float) * 2 * 1100);
@@ -451,13 +541,19 @@ static void voice_kill(Voice *v)
 
 /* make buf hold source frames [f, f + n) as far as possible (decodes forward, seeks if needed).
  * Returns the frames available, or -1 while the file is still loading */
+/* seeks a block: a voice heard again after a quiet stretch (its decoder went on without it) seeks to where it is now,
+ * the file bisected - about 6 ms on the Vita, more than a block's 5.3 ms. The wings' music layers coming in brought five
+ * at once: the block took 118-137% of its time, the mixer's lead the only thing between it and a gap (two a block still
+ * left Level 1 at 139%). Past this many in a block, a voice stays quiet one block more (5.3 ms: it comes in with a
+ * fade anyway) and seeks in the next */
+#define SEEKS_PER_BLOCK 1
+static int blk_seeks;
 static int voice_fill(Voice *v, int64_t f)
 {
     if (!v->opened) { int r = voice_open(v); if (r > 0) return -1; if (r < 0) return 0; }
     if (f < 0) f = 0;
     if (v->pcm) {
-        const MediaLoc *m = &g_mloc[v->media];
-        int64_t n = (int64_t)m->pcm_frames - f; if (n > 1024) n = 1024;
+        int64_t n = (int64_t)v->pcm_frames - f; if (n > 1024) n = 1024;
         v->buf_start = f; v->buf_frames = n > 0 ? (int)n : 0; v->virt = 0;
         const int16_t *src = v->pcm + f * v->ch; float *dst = v->buf;
         for (int k = 0; k < v->buf_frames * v->ch; k++) dst[k] = src[k] * (1.0f / 32768.0f);
@@ -479,6 +575,8 @@ static int voice_fill(Voice *v, int64_t f)
         v->buf_start = f; v->buf_frames = 0; v->fresh = 0;
     }
     if (v->virt || f < v->buf_start || f > v->buf_start + v->buf_frames) {
+        /* (the block's seeks used: a voice coming back from quiet waits a block - not one in play, a loop going round) */
+        if (v->virt && !(v->fresh && f < 4096) && blk_seeks >= SEEKS_PER_BLOCK) return -1;
         unsigned target = (unsigned)f;
         uint64_t t0 = snd_us();
         int ok = 1;
@@ -498,6 +596,7 @@ static int voice_fill(Voice *v, int64_t f)
             if (getenv("SND_SEEKLOG")) fprintf(stderr, "SEEK %.3f node %d media %d (%u) to %u from buf %lld+%d virt %d quiet %d pos %.0f\n", g_now / (double)SND_RATE,
                                                 v->node, v->media, B.media[v->media].id, target, (long long)v->buf_start, v->buf_frames, v->virt, v->quiet, v->pos);
 #endif
+            blk_seeks++;
             ok = stb_vorbis_seek(v->vb, target);
             uint32_t dt_ = (uint32_t)(snd_us() - t0); pf_seek += dt_; pf_seek_n++; if (dt_ > pf_seek_max) pf_seek_max = dt_;
         }
@@ -565,10 +664,13 @@ static int bus_has(int bus, int a)
 static Voice *voice_alloc(void)
 {
     for (int i = 0; i < MAXV; i++) if (!V[i].active) { memset(&V[i], 0, sizeof V[i]); return &V[i]; }
-    /* steal the quietest stopping or oldest non-music voice */
-    int best = -1;
-    for (int i = 0; i < MAXV; i++) if (V[i].stopping) { best = i; break; }
-    if (best < 0) for (int i = 0; i < MAXV; i++) if (V[i].player < 0 || P[V[i].player].kind != 1) { best = i; break; }
+    /* steal: a stopping one, else the quietest that isn't music (not the first found: that was often the car's engine) */
+    int best = -1; float bg = 1e30f;
+    for (int i = 0; i < MAXV; i++) {
+        if (!V[i].stopping && V[i].player >= 0 && P[V[i].player].kind == 1) continue;
+        float g = (V[i].stopping ? -1.0f : 0.0f) + V[i].gl + V[i].gr;
+        if (g < bg) { bg = g; best = i; }
+    }
     if (best < 0) return NULL;
     voice_kill(&V[best]); memset(&V[best], 0, sizeof V[best]);
     return &V[best];
@@ -790,7 +892,7 @@ static void container_update(Player *p)
     p->pick_i++;
     int c = pick_child(p->node);
     if (c >= 0) play_node(c, p->obj, pi, p->root, g_now, xf_ms, 4);
-    if (xf_old >= 0) { V[xf_old].stopping = 1; ramp_set(&V[xf_old].fade, ramp_at(&V[xf_old].fade, g_now), 0, g_now, xf_ms, 4); }
+    if (xf_old >= 0) ramp_stop(&V[xf_old].fade, &V[xf_old].stopping, g_now, xf_ms, 4);
     int tmode = (n->xi[3] >> 4) & 0xF;
     p->next_start = g_now + (tmode == 2 ? (int64_t)(n->xf[0] * SND_RATE / 1000) : 1);
 }
@@ -849,14 +951,10 @@ static void do_action(int ai, int obj)
         if (tgt >= 0) play_node(tgt, obj, -1, tgt, g_now, fade, a->curve);
         break;
     case A_STOP:
-        for (int i = 0; i < MAXP; i++) if (P[i].active && (tgt < 0 || player_matches(&P[i], a, tgt, obj))) {
-            P[i].stopping = 1;
-            ramp_set(&P[i].fade, ramp_at(&P[i].fade, g_now), 0, g_now, fade, a->curve);
-        }
-        for (int i = 0; i < MAXV; i++) if (V[i].active && (tgt < 0 || voice_matches(&V[i], a, tgt, obj))) {
-            V[i].stopping = 1;
-            ramp_set(&V[i].fade, ramp_at(&V[i].fade, g_now), 0, g_now, fade > 0 ? fade : 5, a->curve);
-        }
+        for (int i = 0; i < MAXP; i++) if (P[i].active && (tgt < 0 || player_matches(&P[i], a, tgt, obj)))
+            ramp_stop(&P[i].fade, &P[i].stopping, g_now, fade, a->curve);
+        for (int i = 0; i < MAXV; i++) if (V[i].active && (tgt < 0 || voice_matches(&V[i], a, tgt, obj)))
+            ramp_stop(&V[i].fade, &V[i].stopping, g_now, fade > 0 ? fade : 5, a->curve);
         break;
     case A_PAUSE: case A_RESUME: {
         int pause = a->kind == A_PAUSE;
@@ -969,7 +1067,7 @@ static float voice_gain(Voice *v, float *pan_l, float *pan_r, float *step, float
     const N_Media *m = &B.media[v->media];
     if (pitch > 2400) pitch = 2400; else if (pitch < -2400) pitch = -2400;
     if (vol > 12) vol = 12;
-    *step = (float)m->rate / SND_RATE * powf(2.0f, pitch / 1200.0f);
+    *step = (float)m->rate / SND_RATE * fexp2(pitch * (1.0f / 1200.0f));
     if (lpf < 0) lpf = 0; if (lpf > 100) lpf = 100;
     *lpf_out = lpf;
     float g = db2lin(vol) * ramp_at(&v->fade, g_now) * busmul;
@@ -979,6 +1077,36 @@ static float voice_gain(Voice *v, float *pan_l, float *pan_r, float *step, float
 
 static float mixbuf[BLOCK * 2];
 static float mixann[BLOCK * 2], mixtut[BLOCK * 2];       /* the Announcer bus (its own voices), the Tutorial bus */
+
+/* the mixer's inner loop: n samples of a voice added into out, from 16-bit PCM (the whole file in memory) or the decoder's
+ * floats, mono or stereo, through the low-pass or not; P, S: the position (from the source's first frame) and the
+ * step in 32.32 fixed point; the gains ramp by dgl / dgr a sample */
+#define SPAN_LOOP(T, CH, LP, SC) \
+    for (int k = 0; k < n; k++) { \
+        const T *s = src + (size_t)(uint32_t)(P >> 32) * CH; \
+        float t = (float)(uint32_t)P * 2.3283064e-10f, l, r; \
+        if (CH == 2) { l = ((float)s[0] + ((float)s[2] - (float)s[0]) * t) * SC; r = ((float)s[1] + ((float)s[3] - (float)s[1]) * t) * SC; } \
+        else { l = r = ((float)s[0] + ((float)s[1] - (float)s[0]) * t) * SC; } \
+        if (LP) { y0 += (l - y0) * a; y1 += (r - y1) * a; l = y0; r = y1; } \
+        out[0] += l * cl; out[1] += r * cr; out += 2; \
+        cl += dgl; cr += dgr; P += S; \
+    }
+static void mix_span(float *out, int n, const void *srcv, int is16, int ch, int lp, uint64_t P, uint64_t S,
+                     float cl, float cr, float dgl, float dgr, float a, float *lps)
+{
+    float y0 = lps[0], y1 = lps[1];
+    if (is16) {
+        const int16_t *src = srcv; const float sc = 1.0f / 32768.0f;
+        if (ch == 2) { if (lp) SPAN_LOOP(int16_t, 2, 1, sc) else SPAN_LOOP(int16_t, 2, 0, sc) }
+        else         { if (lp) SPAN_LOOP(int16_t, 1, 1, sc) else SPAN_LOOP(int16_t, 1, 0, sc) }
+    } else {
+        const float *src = srcv; const float sc = 1.0f;
+        if (ch == 2) { if (lp) SPAN_LOOP(float, 2, 1, sc) else SPAN_LOOP(float, 2, 0, sc) }
+        else         { if (lp) SPAN_LOOP(float, 1, 1, sc) else SPAN_LOOP(float, 1, 0, sc) }
+    }
+    lps[0] = y0; lps[1] = y1;
+}
+#undef SPAN_LOOP
 
 #ifdef NR_PC
 static int g_clicklog = -1;
@@ -994,8 +1122,18 @@ static void mix_voice(Voice *v)
     int frames = BLOCK - off;
     if (v->end >= 0 && v->end < g_now + BLOCK) frames = (int)(v->end - g_now) - off;
     if (frames <= 0) { if (v->end >= 0 && v->end <= g_now + BLOCK) v->active = 0; return; }
-    float pl, pr, step, lpf;
-    float g = voice_gain(v, &pl, &pr, &step, &lpf);
+    float pl, pr, step, lpf, g;
+    /* a voice heard as silent last time (and not music, which turns its layers on to the beat) works its gain out every
+     * 4th block only, keeping its pitch meanwhile: the Evil Carwash's far saws */
+    if (v->gain_known && !v->noise && !(v->route & R_MUSIC) && v->last_g * fmaxf(v->last_pl, v->last_pr) <= 0.0003f
+        && v->gl <= 0.0003f && v->gr <= 0.0003f && (++v->skip & 3)) {
+        g = v->last_g; pl = v->last_pl; pr = v->last_pr; step = v->last_step; lpf = v->last_lpf;
+    } else {
+        uint64_t tg_ = g_bprof ? snd_us() : 0;
+        g = voice_gain(v, &pl, &pr, &step, &lpf);
+        if (g_bprof) pf_gain += snd_us() - tg_;
+        v->last_g = g; v->last_pl = pl; v->last_pr = pr; v->last_step = step; v->last_lpf = lpf; v->gain_known = 1;
+    }
     float gl = g * pl, gr = g * pr;
     int audible = (gl > 0.0003f || gr > 0.0003f || v->gl > 0.0003f || v->gr > 0.0003f);
     /* a stream that just fell silent (a music layer switched off) keeps decoding for 2 s: switched back on soon
@@ -1011,7 +1149,8 @@ static void mix_voice(Voice *v)
         /* SoundSeed Woosh (the bank's source plug-ins, made here): noise through a resonant band-pass round the plug-ins'
          * 440 Hz deflector, its centre falling as the thing goes by (about 0.7 octave each side, as the Rel_Distance pitch
          * curve), swelling and fading. Each plug-in's own gain and speed follow CarEngineRPM as its RTPCs say (the
-         * checkpoint's woosh 20-40 dB down). (Before: wide noise, two thirds of it above 2 kHz - static, not a woosh) */
+         * checkpoint's woosh 20-40 dB down). (Before: wide noise, two thirds of it above 2 kHz - static, not a woosh)
+         * The swell (sin^2 over the length) is worked out at the block's ends and drawn straight between them */
         float *out = dst + off * 2;
         double total = (double)v->src_end;
         float dgl = (gl - v->gl) / frames, dgr = (gr - v->gr) / frames, cl = v->gl, cr = v->gr;
@@ -1019,24 +1158,29 @@ static void mix_voice(Voice *v)
         float rpm = g_gp_rpm >= 0 ? g_gp[g_gp_rpm] : 1.0f; rpm = rpm < 0 ? 0 : rpm > 1 ? 1 : rpm;
         float pg = db2lin(wd->db0 + (wd->db1 - wd->db0) * rpm) * 0.075f, spd = wd->s0 + (wd->s1 - wd->s0) * rpm;
         float tm = (float)((pos + step * frames * 0.5) / total); if (tm > 1) tm = 1;
-        float fc = 440.0f * spd * exp2f((0.5f - tm) * 1.4f); if (fc > 6000) fc = 6000;
+        float fc = 440.0f * spd * fexp2((0.5f - tm) * 1.4f); if (fc > 6000) fc = 6000;
         const float Q = 3.0f, q = 1.0f / Q;
         float f1 = 2.0f * sinf(3.14159265f * fc / SND_RATE), norm = 1.732f / sqrtf(3.14159265f * fc / (Q * SND_RATE));
-        for (int i = 0; i < frames; i++) {
-            if (pos >= total) { voice_kill(v); return; }
-            float t = (float)(pos / total);
-            float env = sinf(t * 3.14159f); env *= env;
-            v->nseed = v->nseed * 1664525u + 1013904223u;
-            float n = ((v->nseed >> 9) * (1.0f / 4194304.0f)) - 1.0f;
-            v->nf1 += f1 * v->nf2;                            /* state-variable filter: nf1 low, nf2 band */
-            float hp = n - v->nf1 - q * v->nf2;
-            v->nf2 += f1 * hp;
-            float s = v->nf2 * norm * pg * env;
-            out[i * 2] += s * cl; out[i * 2 + 1] += s * cr;
-            cl += dgl; cr += dgr;
-            pos += step;
+        int n = frames, dies = 0;
+        if (pos + step * (frames - 1) >= total) { n = (int)ceil((total - pos) / step); if (n < 0) n = 0; if (n > frames) n = frames; dies = 1; }
+        float t0 = (float)(pos / total), t1 = (float)((pos + step * n) / total);
+        float e0 = sinf(t0 * 3.14159f), e1 = sinf((t1 > 1 ? 1 : t1) * 3.14159f);
+        e0 *= e0 * norm * pg; e1 *= e1 * norm * pg;
+        float de = n > 0 ? (e1 - e0) / n : 0, env = e0;
+        float nf1 = v->nf1, nf2 = v->nf2; uint32_t seed = v->nseed;
+        for (int i = 0; i < n; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            float x = ((seed >> 9) * (1.0f / 4194304.0f)) - 1.0f;
+            nf1 += f1 * nf2;                                  /* state-variable filter: nf1 low, nf2 band */
+            float hp = x - nf1 - q * nf2;
+            nf2 += f1 * hp;
+            float sm = nf2 * env;
+            out[i * 2] += sm * cl; out[i * 2 + 1] += sm * cr;
+            cl += dgl; cr += dgr; env += de;
         }
-        v->pos = pos; v->gl = gl; v->gr = gr;
+        v->nf1 = nf1; v->nf2 = nf2; v->nseed = seed;
+        if (dies) { voice_kill(v); return; }
+        v->pos = pos + step * frames; v->gl = gl; v->gr = gr;
         return;
     }
     if (!audible) {
@@ -1051,9 +1195,16 @@ static void mix_voice(Voice *v)
         v->pos = pos; v->virt = 1; v->gl = gl; v->gr = gr;
         return;
     }
-    g_stat_dec++;
+    if (v->vb && v->opened) {                 /* its file decoded to PCM meanwhile (shared): read that from here on */
+        int16_t *pr = __atomic_load_n(&g_mloc[v->media].promo, __ATOMIC_ACQUIRE);
+        if (pr) {
+            stb_vorbis_close(v->vb); v->vb = NULL;
+            v->pcm = pr; v->ch = g_mloc[v->media].promo_ch; v->pcm_frames = g_mloc[v->media].promo_frames; v->virt = 0;
+        }
+    }
+    g_stat_dec++; if (!v->pcm) g_stat_vorb++;
     /* low-pass: Wwise LPF 0..100 -> one-pole coefficient */
-    float a = lpf <= 0.5f ? 1.0f : expf(-lpf * 0.045f);
+    float a = lpf <= 0.5f ? 1.0f : fexp2(-lpf * 0.0649213f);       /* exp(-0.045 lpf) */
     float dgl = (gl - v->gl) / frames, dgr = (gr - v->gr) / frames;
     float cl = v->gl, cr = v->gr;
     float *out = dst + off * 2;
@@ -1066,8 +1217,8 @@ static void mix_voice(Voice *v)
             pos = loop_s + (pos - loop_e); if (loop_e <= loop_s) { voice_kill(v); return; }
             continue;
         }
-        if (fi < v->buf_start || fi + 1 >= v->buf_start + v->buf_frames) {
-            int got = voice_fill(v, fi);
+        if (!v->opened || (!v->pcm && (fi < v->buf_start || fi + 1 >= v->buf_start + v->buf_frames)) || (v->pcm && fi + 1 >= (int64_t)v->pcm_frames)) {
+            int got = v->pcm && v->opened ? 1 : voice_fill(v, fi);
             if (got < 0) {                            /* its file is still loading: run silently */
                 pos += step * (frames - i);
                 while (pos >= loop_e) {
@@ -1079,45 +1230,28 @@ static void mix_voice(Voice *v)
                 v->pos = pos; v->virt = 1; v->gl = gl; v->gr = gr;
                 return;
             }
-            if (got < 2) {
-                if (!v->opened) { voice_kill(v); return; }
-                pos = loop_e; v->virt = 1;            /* stream ended early: treat as the loop end */
+            if (!v->opened) { voice_kill(v); return; }
+            if (v->pcm ? fi + 1 >= (int64_t)v->pcm_frames : got < 2) {
+                pos = loop_e; v->virt = 1;            /* the file ends before its loop does: as the loop end */
                 continue;
             }
         }
-        const float *b = v->buf;
-        for (; i < frames; i++) {
-            int64_t f0 = (int64_t)pos;
-            if (f0 >= loop_e || f0 + 1 >= v->buf_start + v->buf_frames) break;
-            float t = (float)(pos - (double)f0);
-            int o = (int)(f0 - v->buf_start) * v->ch;
-            float l, r;
-            if (v->ch == 2) { l = b[o] + (b[o + 2] - b[o]) * t; r = b[o + 1] + (b[o + 3] - b[o + 1]) * t; }
-            else { l = r = b[o] + (b[o + 1] - b[o]) * t; }
-            if (a < 1.0f) { v->lp[0] += (l - v->lp[0]) * a; v->lp[1] += (r - v->lp[1]) * a; l = v->lp[0]; r = v->lp[1]; }
-            out[i * 2] += l * cl; out[i * 2 + 1] += r * cr;
-#ifdef NR_PC
-            if (g_clicklog) {
-                float x[2] = { l * cl, r * cr };
-                for (int c = 0; c < 2; c++) {
-                    if (v->dbg_n >= 2) { float d = fabsf(x[c] - 2 * v->dbg[c][0] + v->dbg[c][1]); if (d > v->dbg_max) { v->dbg_max = d; v->dbg_at = g_now + off + i; } }
-                    v->dbg[c][1] = v->dbg[c][0]; v->dbg[c][0] = x[c];
-                }
-                v->dbg_n++;
-            }
-#endif
-            cl += dgl; cr += dgr;
-            pos += step;
-        }
+        /* a run of samples that stays inside the loop and the decoded frames (each needs its next one): the position in
+         * 32.32 fixed point from there on (the double and its int64 conversions cost the Vita's VFP ~40 cycles a sample) */
+        int64_t sbase = v->pcm ? 0 : v->buf_start, send = v->pcm ? (int64_t)v->pcm_frames : v->buf_start + v->buf_frames;
+        double lim = (double)(send - 1 < (int64_t)loop_e ? send - 1 : (int64_t)loop_e);
+        int n = (int)ceil((lim - pos) / step);
+        if (n > frames - i) n = frames - i;
+        while (n > 0 && pos + (n - 1) * (double)step >= lim) n--;
+        if (n <= 0) { pos = (double)(int64_t)pos + 1; continue; }   /* (the guard: a step rounding past the boundary) */
+        uint64_t P = (uint64_t)((pos - (double)sbase) * 4294967296.0), S = (uint64_t)((double)step * 4294967296.0 + 0.5);
+        mix_span(out + i * 2, n, v->pcm ? (const void *)v->pcm : (const void *)v->buf, v->pcm != NULL, v->ch, a < 1.0f, P, S,
+                 cl, cr, dgl, dgr, a, v->lp);
+        cl += dgl * n; cr += dgr * n;
+        pos += (double)step * n;
+        i += n;
     }
     v->pos = pos; v->gl = gl; v->gr = gr;
-#ifdef NR_PC
-    if (g_clicklog && v->dbg_max > 0.12f) {
-        fprintf(stderr, "VCLICK %.3f node %d media %d obj %d jump %.2f gain %.2f/%.2f pos %.0f/%u%s\n", v->dbg_at / (double)SND_RATE, v->node, v->media, v->obj,
-                v->dbg_max, gl, gr, pos, loop_e, v->fresh ? " fresh" : "");
-    }
-    v->dbg_max = 0;
-#endif
 }
 
 /* the Init.bnk busses' meter and effects, once per block (see the top) */
@@ -1147,7 +1281,7 @@ static int limit_ok(int k)
             Voice *v = &V[j];
             if (!v->active || v->stopping || !(v->node == k || has_ancestor(v->node, k))) continue;
             if (L1[i].keep_old) return 0;
-            v->stopping = 1; ramp_set(&v->fade, ramp_at(&v->fade, g_now), 0, g_now, 10, 4);
+            ramp_stop(&v->fade, &v->stopping, g_now, 10, 4);
         }
         return 1;
     }
@@ -1170,8 +1304,15 @@ static void process_commands(void)
 {
     uint32_t t = __atomic_load_n(&q_tail, __ATOMIC_RELAXED);
     uint32_t h = __atomic_load_n(&q_head, __ATOMIC_ACQUIRE);
+#ifdef NR_PC
+    static FILE *rec; static int rec_on = -1;       /* (the test machine, SND_REC=file: every command with its block's time, for tools/pc/sndbench) */
+    if (rec_on < 0) { rec_on = getenv("SND_REC") != NULL; if (rec_on) rec = fopen(getenv("SND_REC"), "wb"); }
+#endif
     while (t != h) {
         Cmd *c = &Q[t % QN];
+#ifdef NR_PC
+        if (rec) { fwrite(&g_now, 8, 1, rec); fwrite(c, sizeof *c, 1, rec); }
+#endif
         switch (c->type) {
         case C_POST: post_event(c->id, c->obj); break;
         case C_PARAM: { int g = find_gp(c->id); if (g >= 0) { g_gp[g] = c->v[0]; g_gp_set[g] = 1; } break; }
@@ -1181,8 +1322,8 @@ static void process_commands(void)
             break;
         case C_LISTENER: memcpy(g_lis_pos, c->v, 12); memcpy(g_lis_fwd, c->v + 3, 12); memcpy(g_lis_up, c->v + 6, 12); break;
         case C_STOPOBJ:
-            for (int i = 0; i < MAXP; i++) if (P[i].active && P[i].obj == c->obj) { P[i].stopping = 1; ramp_set(&P[i].fade, ramp_at(&P[i].fade, g_now), 0, g_now, c->v[0], 4); }
-            for (int i = 0; i < MAXV; i++) if (V[i].active && V[i].obj == c->obj) { V[i].stopping = 1; ramp_set(&V[i].fade, ramp_at(&V[i].fade, g_now), 0, g_now, c->v[0] > 5 ? c->v[0] : 5, 4); }
+            for (int i = 0; i < MAXP; i++) if (P[i].active && P[i].obj == c->obj) ramp_stop(&P[i].fade, &P[i].stopping, g_now, c->v[0], 4);
+            for (int i = 0; i < MAXV; i++) if (V[i].active && V[i].obj == c->obj) ramp_stop(&V[i].fade, &V[i].stopping, g_now, c->v[0] > 5 ? c->v[0] : 5, 4);
             break;
         case C_OBJCLEAR:
             if (c->obj > 0 && c->obj < SND_MAX_OBJ) memset(&O[c->obj], 0, sizeof O[0]);
@@ -1221,6 +1362,7 @@ static void update_objects(void)
 
 static void mix_block(void)
 {
+    blk_seeks = 0;
     process_commands();
     media_trim();
     update_objects();
@@ -1250,19 +1392,54 @@ static void mix_block(void)
     g_now += BLOCK;
 }
 
+/* The output stage: 6 dB of headroom (the bank's sounds are mastered hot), then a look-ahead peak limiter. Many
+ * copies of one sound at once - warp_speed's rings (RingRipple, 20 and more within a second), Gray's falling
+ * buildings and their shards - can add up to 10 dB past full scale; the PC game's Master bus compressor (not done
+ * here, see the top) kept them down, and a limit sample by sample (as before) clipped them into a crackle. Instead
+ * each block is played one block (5.3 ms) late, so the gain can come down smoothly across the block before a loud
+ * one, to have its peaks at LIM_T; it comes back with a 150 ms release. Below LIM_T nothing changes. */
+#define LIM_T 0.89f                                    /* (-1 dB full scale) */
+static float lim_prev[BLOCK * 2];                      /* the block being held back */
+static float lim_g = 1, lim_need_prev = 1;
+static float lim_min_lv = 1; static unsigned lim_blocks_lv;   /* (for the level's report: lowest gain, blocks held down) */
+static float block_need(const float *b)
+{
+    float pk = 0;
+    for (int i = 0; i < BLOCK * 2; i++) { float a = fabsf(b[i]); if (a > pk) pk = a; }
+    pk *= 0.5f;
+    return pk > LIM_T ? LIM_T / pk : 1.0f;
+}
 static void render(int16_t *out, int frames)
 {
+    const float rel = 1.0f - expf(-(float)BLOCK / (SND_RATE * 0.15f));
     while (frames > 0) {
-        g_stat_dec = 0;
+        g_stat_dec = 0; g_stat_vorb = 0;
         mix_block();
         int n = frames < BLOCK ? frames : BLOCK;
-        for (int i = 0; i < n * 2; i++) {
-            float x = mixbuf[i] * 0.5f, ax = fabsf(x);      /* 6 dB of headroom: the bank's sounds are mastered hot */
-            if (ax > 0.75f) x = copysignf(0.75f + 0.25f * tanhf((ax - 0.75f) * 4.0f), x);   /* soft limit */
-            out[i] = (int16_t)(x * 32767.0f);
+        float need = block_need(mixbuf);
+        float g0 = lim_g, g1 = g0 + (1.0f - g0) * rel;     /* (released towards 1) */
+        if (g1 > 0.9999f) g1 = 1.0f;
+        if (g1 > lim_need_prev) g1 = lim_need_prev;         /* the held block's own peaks */
+        if (g1 > need) g1 = need;                           /* and the next one's: down by its start */
+        if (g1 < 1.0f || g0 < 1.0f) { lim_blocks_lv++; if (g1 < lim_min_lv) lim_min_lv = g1; }
+        const float dg = (g1 - g0) / (float)n;
+        for (int i = 0; i < n; i++) {
+            float g = (g0 + dg * (float)(i + 1)) * 0.5f;
+            float l = lim_prev[2 * i] * g, r = lim_prev[2 * i + 1] * g;
+            l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l; r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+            out[2 * i] = (int16_t)(l * 32767.0f); out[2 * i + 1] = (int16_t)(r * 32767.0f);
         }
+        lim_g = g1; lim_need_prev = need;
+        memcpy(lim_prev, mixbuf, sizeof lim_prev);
         out += n * 2; frames -= n;
     }
+}
+/* the limiter in the level so far (and from now on, anew): its lowest gain (dB) and how long it held the sound down (ms) */
+void snd_limiter_lv(float *min_db, float *held_ms)
+{
+    if (min_db) *min_db = 20.0f * log10f(lim_min_lv > 1e-6f ? lim_min_lv : 1e-6f);
+    if (held_ms) *held_ms = lim_blocks_lv * 1000.0f * BLOCK / SND_RATE;
+    lim_min_lv = 1; lim_blocks_lv = 0;
 }
 void snd_render(int16_t *out, int frames) { if (g_ready) render(out, frames); else memset(out, 0, frames * 4); }
 
@@ -1287,7 +1464,7 @@ static int out_thread(SceSize args, void *argp)
         if (sceKernelWaitSema(g_sem_full, 1, &to) < 0) continue;
         SceUInt64 t = sceKernelGetProcessTimeWide();
         /* the buffer before ran out before this one was ready: a gap you can hear */
-        if (prev >= 0 && t - t_play > (SceUInt64)(GRAIN * 1000000ull / SND_RATE) + 2000) { g_late++; g_late1++; }
+        if (prev >= 0 && t - t_play > (SceUInt64)(GRAIN * 1000000ull / SND_RATE) + 2000) { g_late++; g_late1++; g_late2++; }
         sceAudioOutOutput(g_port, g_ring[r]);           /* returns when the one before has played */
         t_play = sceKernelGetProcessTimeWide();
         if (prev >= 0) sceKernelSignalSema(g_sem_free, 1);
@@ -1319,6 +1496,7 @@ static int snd_thread(SceSize args, void *argp)
         g_load = g_load * 0.97f + load * 0.03f;
         if (load > g_peak) g_peak = load;
         if (load > g_peak1) g_peak1 = load;
+        if (load > g_peak2) g_peak2 = load;
         w = (w + 1) % NRING;
         sceKernelSignalSema(g_sem_full, 1);
     }
@@ -1376,6 +1554,7 @@ int snd_init(nr_pak *pak, int start_thread)
         while (j >= 0 && B.events[j].id > e.id) { B.events[j + 1] = B.events[j]; j--; }
         B.events[j + 1] = e;
     }
+    g_cx = calloc(B.n_curves + 1, sizeof(float)); g_cy = calloc(B.n_curves + 1, sizeof(float)); g_cv = calloc(B.n_curves + 1, 1);
     g_vol_ovr = calloc(B.n_nodes, sizeof(Ramp)); g_pitch_ovr = calloc(B.n_nodes, sizeof(Ramp)); g_lpf_ovr = calloc(B.n_nodes, sizeof(Ramp));
     g_bus_fade = calloc(B.n_nodes, sizeof(Ramp));
     g_seq_pos = calloc(B.n_nodes, sizeof(int)); g_mseq = calloc(B.n_mitems + 1, sizeof(int)); g_hist = calloc(B.n_nodes * 4, sizeof(int));
@@ -1449,26 +1628,74 @@ void snd_shutdown(void)
     g_ready = 0;
 }
 
+void (*snd_evlog)(const char *);
+static struct { struct { uint32_t id; int n; } e[64]; int n, total; } EVC[2];   /* (two counts: scope 0 and 1) */
+static void ev_count(uint32_t id)
+{
+    for (int s = 0; s < 2; s++) {
+        EVC[s].total++;
+        int i; for (i = 0; i < EVC[s].n && EVC[s].e[i].id != id; i++) {}
+        if (i < EVC[s].n) EVC[s].e[i].n++;
+        else if (EVC[s].n < 64) { EVC[s].e[i].id = id; EVC[s].e[i].n = 1; EVC[s].n++; }
+    }
+}
+int snd_ev_report(void (*out)(const char *), const char *what, int top, int scope)
+{
+    const int total = EVC[scope].total;
+    if (out && total) {
+        char l[400]; int o = snprintf(l, sizeof l, "sound events %s: %d posted, the most:", what, total);
+        for (int k = 0; k < top; k++) {
+            int b = -1; for (int i = 0; i < EVC[scope].n; i++) if (EVC[scope].e[i].n > 0 && (b < 0 || EVC[scope].e[i].n > EVC[scope].e[b].n)) b = i;
+            if (b < 0) break;
+            char nb[64]; snprintf(nb, sizeof nb, "%s", snd_event_name(EVC[scope].e[b].id)); char *sp = strchr(nb, ' '); if (sp) *sp = 0;
+            if (o < (int)sizeof l - 1) o += snprintf(l + o, sizeof l - o, " %s %d", nb, EVC[scope].e[b].n);
+            EVC[scope].e[b].n = -EVC[scope].e[b].n;
+        }
+        out(l);
+    }
+    EVC[scope].n = 0; EVC[scope].total = 0;
+    return total;
+}
 int snd_post_id(uint32_t id, int obj)
 {
     if (!g_ready || find_event(id) < 0) return 0;
+    ev_count(id);
+    if (snd_evlog) { char l[120]; snprintf(l, sizeof l, "EV %.3f %s obj %d", g_now / (double)SND_RATE, snd_event_name(id), obj); snd_evlog(l); }
 #ifdef NR_PC
     {   static int evlog = -1; if (evlog < 0) evlog = getenv("SND_EVLOG") != NULL;   /* (the test machine: every event posted) */
-        if (evlog) fprintf(stderr, "EV %.3f %s obj %d\n", g_now / (double)SND_RATE, snd_event_name(id), obj); }
+        if (evlog) fprintf(stderr, "EV %.3f %s obj %d\n", g_now / (double)SND_RATE, snd_event_name(id), obj);
+        if (evlog && getenv("SND_EVACT")) {                /* (and, once each, its actions) */
+            static uint32_t seen[256]; static int ns; int k; for (k = 0; k < ns && seen[k] != id; k++) {}
+            if (k == ns && ns < 256) { seen[ns++] = id; const N_Event *ev = &B.events[find_event(id)];
+                for (uint32_t i = 0; i < ev->n; i++) { const N_Action *a = &B.actions[ev->first + i];
+                    fprintf(stderr, "EVACT   kind %d target %d (node %u type %d) fade %.0f ms curve %d delay %.0f scope %x\n", a->kind, a->target,
+                            a->target >= 0 ? B.nodes[a->target].id : 0, a->target >= 0 ? B.nodes[a->target].type : -1, a->fade, a->curve, a->delay, a->scope); } } } }
 #endif
     Cmd c = {C_POST, id, obj, {0}}; push_cmd(&c); return 1;
 }
 int snd_post(const char *event, int obj) { return snd_post_id(snd_hash(event), obj); }
 void snd_set_param(const char *name, float v) { if (!g_ready) return; Cmd c = {C_PARAM, snd_hash(name), 0, {v}}; push_cmd(&c); }
 void snd_set_obj_param(int obj, const char *name, float v) { if (!g_ready) return; Cmd c = {C_OBJPARAM, snd_hash(name), obj, {v}}; push_cmd(&c); }
-void snd_set_obj_pos(int obj, const float p[3]) { if (!g_ready) return; Cmd c = {C_OBJPOS, 0, obj, {p[0], p[1], p[2]}}; push_cmd(&c); }
+/* (the game's thread: a position the mixer already has isn't sent again - the Evil Carwash's 48 still saws filled the
+ * queue each frame) */
+static float sent_pos[SND_MAX_OBJ][3]; static uint8_t sent_ok[SND_MAX_OBJ];
+void snd_set_obj_pos(int obj, const float p[3])
+{
+    if (!g_ready) return;
+    if (obj > 0 && obj < SND_MAX_OBJ) {
+        if (sent_ok[obj] && sent_pos[obj][0] == p[0] && sent_pos[obj][1] == p[1] && sent_pos[obj][2] == p[2]) return;
+    }
+    Cmd c = {C_OBJPOS, 0, obj, {p[0], p[1], p[2]}};
+    int ok = push_cmd(&c);
+    if (obj > 0 && obj < SND_MAX_OBJ) { memcpy(sent_pos[obj], p, 12); sent_ok[obj] = ok; }
+}
 void snd_set_listener(const float p[3], const float f[3], const float u[3])
 {
     if (!g_ready) return;
     Cmd c = {C_LISTENER, 0, 0, {p[0], p[1], p[2], f[0], f[1], f[2], u[0], u[1], u[2]}}; push_cmd(&c);
 }
 void snd_stop_obj(int obj, float fade_ms) { if (!g_ready) return; Cmd c = {C_STOPOBJ, 0, obj, {fade_ms}}; push_cmd(&c); }
-void snd_clear_obj(int obj) { if (!g_ready) return; Cmd c = {C_OBJCLEAR, 0, obj, {0}}; push_cmd(&c); }
+void snd_clear_obj(int obj) { if (!g_ready) return; if (obj > 0 && obj < SND_MAX_OBJ) sent_ok[obj] = 0; Cmd c = {C_OBJCLEAR, 0, obj, {0}}; push_cmd(&c); }
 void snd_stop_all(void) { if (!g_ready) return; Cmd c = {C_STOPALL, 0, 0, {0}}; push_cmd(&c); }
 void snd_set_state(const char *group, const char *state)
 {
@@ -1486,14 +1713,112 @@ void snd_stats(int *voices, int *decoding, float *load)
 }
 void snd_peak(float *peak, int *late) { if (peak) *peak = g_peak; if (late) *late = g_late; g_peak = 0; g_late = 0; }
 void snd_peak_sec(float *peak, int *late) { if (peak) *peak = g_peak1; if (late) *late = g_late1; g_peak1 = 0; g_late1 = 0; }
+void snd_peak_lv(float *peak, int *late) { if (peak) *peak = g_peak2; if (late) *late = g_late2; g_peak2 = 0; g_late2 = 0; }
 void snd_prof(char *b, size_t n)
 {
-    snprintf(b, n, "opened %u streams (%.1f ms, slowest %.1f) | seeks %u (%.1f ms, slowest %.1f) | decoding %.1f ms (slowest fill %.1f)",
-             pf_open_n, pf_open / 1000.0f, pf_open_max / 1000.0f, pf_seek_n, pf_seek / 1000.0f, pf_seek_max / 1000.0f, pf_dec / 1000.0f, pf_dec_max / 1000.0f);
+    snprintf(b, n, "opened %u streams (%.1f ms, slowest %.1f) | seeks %u (%.1f ms, slowest %.1f) | decoding %.1f ms (slowest fill %.1f) | shared to PCM %u",
+             pf_open_n, pf_open / 1000.0f, pf_open_max / 1000.0f, pf_seek_n, pf_seek / 1000.0f, pf_seek_max / 1000.0f, pf_dec / 1000.0f, pf_dec_max / 1000.0f, pf_promo);
     pf_open = pf_seek = pf_dec = 0; pf_open_n = pf_seek_n = pf_open_max = pf_seek_max = pf_dec_max = 0;
 }
 
+/* The mixer alone, replaying a recording of what a game run sent it (NRPC's SND_REC: each command with the time of
+ * its block), timed block by block: tools/pc/sndbench on the PC, the switch file "sndbench" on the Vita (snd_init
+ * without its threads; the file loader then runs inline, and its time is left out). A line a second (the most
+ * voices, those heard, those decoding Vorbis; the mixing time; the worst 1024-frame grain as the mixer thread's
+ * load), then the run's totals. wav: the mix written there too (NULL: not) */
+int snd_bench(const char *rec, const char *wav_path, void (*out)(const char *))
+{
+    typedef struct { int64_t t; Cmd c; } Rec;
+    char ln[200];
+    FILE *f = fopen(rec, "rb");
+    if (!f) { snprintf(ln, sizeof ln, "sndbench: no %s", rec); out(ln); return -1; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    size_t n = fsz > 0 ? (size_t)fsz / (8 + sizeof(Cmd)) : 0;
+    Rec *r = n ? malloc(n * sizeof *r) : NULL;
+    size_t got = 0;
+    while (r && got < n && fread(&r[got].t, 8, 1, f) == 1 && fread(&r[got].c, sizeof(Cmd), 1, f) == 1) got++;
+    fclose(f);
+    if (!got) { free(r); snprintf(ln, sizeof ln, "sndbench: %s is empty", rec); out(ln); return -1; }
+    FILE *wav = wav_path ? fopen(wav_path, "wb") : NULL;
+    if (wav) { uint8_t hdr[44] = {0}; fwrite(hdr, 1, 44, wav); }
+    /* a clean start: nothing playing, the clock at the recording's own zero */
+    for (int i = 0; i < MAXV; i++) if (V[i].active) voice_kill(&V[i]);
+    for (int i = 0; i < MAXP; i++) P[i].active = 0;
+    for (int i = 0; i < MAXD; i++) D[i].t = 0;
+    g_now = 0;
+    int64_t end = r[got - 1].t + 2 * SND_RATE;
+    size_t k = 0; static int16_t pcm[BLOCK * 2];
+    uint64_t sec_us = 0, tot_us = 0, sec_media = 0, grain_us = 0, dec0 = 0, gain0 = 0, tot_dec = 0, tot_gain = 0; uint32_t data = 0;
+    g_bprof = 1; pf_gain = 0; pf_dec = 0;
+    int sec_blocks = 0, gb = 0, maxv = 0, maxd = 0, maxb = 0, grains = 0, over = 0;
+    float worst = 0, worst_all = 0;
+    while (g_now < end) {
+        while (k < got && r[k].t <= g_now) { push_cmd(&r[k].c); k++; }
+        uint64_t m0 = pf_media, t0 = snd_us();
+        render(pcm, BLOCK);
+        uint64_t dt = snd_us() - t0, dm = pf_media - m0, mix = dt > dm ? dt - dm : 0;
+        sec_us += mix; tot_us += mix; sec_media += dm; grain_us += mix;
+        if (g_stat_voices > maxv) maxv = g_stat_voices;
+        if (g_stat_dec > maxd) maxd = g_stat_dec;
+        if (g_stat_vorb > maxb) maxb = g_stat_vorb;
+        if (wav) { fwrite(pcm, 4, BLOCK, wav); data += BLOCK * 4; }
+        if (++gb == 1024 / BLOCK) {               /* a grain: what the mixer thread renders at once (21.3 ms of sound) */
+            float load = grain_us / (1024 * 1e6f / SND_RATE);
+            if (load > worst) worst = load;
+            if (load > worst_all) worst_all = load;
+            grains++; if (load > 1.0f) over++;
+            gb = 0; grain_us = 0;
+        }
+#ifdef NR_PC
+        if (getenv("BENCH_VORBIS") && sec_blocks == 0 && (int)(g_now / SND_RATE) % 5 == 0) {   /* (which voices decode, every 5 s) */
+            for (int i = 0; i < MAXV; i++) if (V[i].active && V[i].vb && !V[i].pcm)
+                printf("   vorbis v%d media %u (%u KB, %u frames, ch %d) music %d virt %d\n", i, B.media[V[i].media].id, g_mloc[V[i].media].size / 1024,
+                       B.media[V[i].media].samples, V[i].ch, (V[i].route & R_MUSIC) != 0, V[i].virt);
+        }
+#endif
+        if (++sec_blocks * BLOCK >= SND_RATE) {
+            snprintf(ln, sizeof ln, "sndbench t %5.1f s: voices %2d (heard %2d, Vorbis %2d) mixing %6.2f ms/s (%4.1f%%: decoding %.1f, gains %.1f), worst grain %3.0f%%, loader %.1f ms",
+                     g_now / (double)SND_RATE, maxv, maxd, maxb, sec_us / 1000.0, sec_us / 10000.0, (pf_dec - dec0) / 1000.0, (pf_gain - gain0) / 1000.0,
+                     worst * 100, sec_media / 1000.0);
+            out(ln);
+            tot_dec += pf_dec - dec0; tot_gain += pf_gain - gain0; dec0 = pf_dec; gain0 = pf_gain;
+            sec_us = 0; sec_blocks = 0; maxv = maxd = maxb = 0; worst = 0; sec_media = 0;
+        }
+    }
+    double secs = g_now / (double)SND_RATE;
+    snprintf(ln, sizeof ln, "sndbench %s: %.1f ms of mixing for %.1f s of sound (%.1f%% of a core: decoding %.1f%%, gains %.1f%%), worst grain %.0f%%, %d of %d grains over 100%%, shared files to PCM %u",
+             rec, tot_us / 1000.0, secs, tot_us / (secs * 10000.0), tot_dec / (secs * 10000.0), tot_gain / (secs * 10000.0), worst_all * 100, over, grains, pf_promo);
+    g_bprof = 0;
+    out(ln);
+    if (wav) {
+        uint8_t h[44]; uint32_t rate = SND_RATE, br = SND_RATE * 4, riff = 36 + data, fl = 16; uint16_t fmt = 1, ch = 2, ba = 4, bits = 16;
+        memcpy(h, "RIFF", 4); memcpy(h + 4, &riff, 4); memcpy(h + 8, "WAVEfmt ", 8);
+        memcpy(h + 16, &fl, 4); memcpy(h + 20, &fmt, 2); memcpy(h + 22, &ch, 2); memcpy(h + 24, &rate, 4); memcpy(h + 28, &br, 4);
+        memcpy(h + 32, &ba, 2); memcpy(h + 34, &bits, 2); memcpy(h + 36, "data", 4); memcpy(h + 40, &data, 4);
+        fseek(wav, 0, SEEK_SET); fwrite(h, 1, 44, wav); fclose(wav);
+    }
+    for (int i = 0; i < MAXV; i++) if (V[i].active) voice_kill(&V[i]);
+    for (int i = 0; i < MAXP; i++) P[i].active = 0;
+    free(r);
+    return 0;
+}
+
 /* debug listing of what is playing (PC tools / boot log) */
+#ifdef NR_PC
+/* (the test machine, ENGINECHECK: the looping voices playing on an object - the car's engine - and the loudest one's gain, dB) */
+int snd_obj_voices(int obj, float *loudest_db)
+{
+    int n = 0; float g = 0;
+    for (int i = 0; i < MAXV; i++) {
+        Voice *v = &V[i];
+        if (!v->active || v->obj != obj || v->stopping || v->loops_left != 0 || v->end >= 0) continue;   /* (loops: the engine's) */
+        float pl, pr, st, lp; float gg = voice_gain(v, &pl, &pr, &st, &lp);
+        n++; if (gg > g) g = gg;
+    }
+    *loudest_db = g > 0 ? 20 * log10f(g) : -999;
+    return n;
+}
+#endif
 void snd_debug_dump(void (*out)(const char *))
 {
     {   char l0[96]; snprintf(l0, sizeof l0, "media cache %.1f MB, load queue %u", __atomic_load_n(&g_mem_bytes, __ATOMIC_RELAXED) / 1048576.0f, rq_head - rq_tail); out(l0); }

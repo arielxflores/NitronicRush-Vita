@@ -1,5 +1,6 @@
 #include "nr_pak.h"
 #include "tinf/tinf.h"
+#include "libdeflate/libdeflate.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,27 +64,73 @@ int nr_pak_open(nr_pak *p, const char *path)
     return r;
 }
 
+#ifdef NR_PC
+/* (the test machine, NRPAK_FAIL=n: every n-th read from a pack that was already open fails, as a stale file handle
+ * would - to try the reopening below) */
+static int fail_test(void)
+{
+    static int every = -1, k;
+    if (every < 0) { const char *s = getenv("NRPAK_FAIL"); every = s ? atoi(s) : 0; }
+    return every > 0 && ++k % every == 0;
+}
+#else
+#define fail_test() 0
+#endif
+
+/* (the loading's report: the time in reading the packs and in unpacking their entries, and how much; the clock is the
+ * game's, set by it - none: not counted) */
+uint64_t (*nr_pak_clock)(void);
+uint64_t nr_pak_read_us, nr_pak_unpack_us, nr_pak_bytes_read, nr_pak_bytes_unpacked;
+/* one read of an entry from its pack: 0 if the file could not be read (or did not unpack) */
+static uint8_t *read_entry(nr_pak *p, const nr_pak_entry *e, int pack, int *was_open)
+{
+    *was_open = p->f[pack] != NULL;
+    FILE *f = pack_file(p, pack);
+    if (!f) return NULL;
+    uint8_t *b = malloc(e->size + 1);
+    if (!b) return NULL;
+    uint64_t t0 = nr_pak_clock ? nr_pak_clock() : 0;
+    if (fseek(f, e->off, SEEK_SET) != 0 || fread(b, 1, e->size, f) != e->size || (*was_open && fail_test())) { free(b); return NULL; }
+    b[e->size] = 0;
+    uint64_t t1 = nr_pak_clock ? nr_pak_clock() : 0;
+    nr_pak_read_us += t1 - t0; nr_pak_bytes_read += e->size;
+    if (e->raw) {                                        /* deflated entry */
+        uint8_t *r = malloc(e->raw + 1);
+        unsigned int len = e->raw;
+        /* libdeflate: the same bytes as tinf (all 1267 deflated entries of the game's packs compared), several times faster
+         * - unpacking was most of a level's loading on the Vita. (One decompressor, kept: the packs are read on the game's
+         * thread only.) tinf if it can't be made or refuses an entry */
+        static struct libdeflate_decompressor *dd; static int dd_failed;
+        if (!dd && !dd_failed) { dd = libdeflate_alloc_decompressor(); dd_failed = !dd; }
+        size_t got = 0;
+        int ok = r && dd && libdeflate_deflate_decompress(dd, b, e->size, r, e->raw, &got) == LIBDEFLATE_SUCCESS && got == e->raw;
+        if (!ok && (!r || tinf_uncompress(r, &len, b, e->size) != TINF_OK || len != e->raw)) { free(r); free(b); return NULL; }
+        free(b); b = r; b[e->raw] = 0;
+        if (nr_pak_clock) nr_pak_unpack_us += nr_pak_clock() - t1;
+        nr_pak_bytes_unpacked += e->raw;
+    }
+    return b;
+}
+
+int nr_pak_reopened;                                     /* (reads that only worked with the pack opened again) */
 void *nr_pak_read(nr_pak *p, const char *name, uint32_t *size)
 {
     for (uint32_t i = 0; i < p->count; i++) {
         nr_pak_entry *e = &p->ents[i];
         if (strncmp(e->name, name, sizeof e->name)) continue;
-        FILE *f = pack_file(p, p->file_of[i]);
-        if (!f) return NULL;
-        uint8_t *b = malloc(e->size + 1);
-        if (!b) return NULL;
-        fseek(f, e->off, SEEK_SET);
-        if (fread(b, 1, e->size, f) != e->size) { free(b); return NULL; }
-        b[e->size] = 0;
-        if (e->raw) {                                    /* deflated entry */
-            uint8_t *r = malloc(e->raw + 1);
-            unsigned int len = e->raw;
-            if (!r || tinf_uncompress(r, &len, b, e->size) != TINF_OK || len != e->raw) { free(r); free(b); return NULL; }
-            free(b); b = r; b[e->raw] = 0;
-            if (size) *size = e->raw;
-            return b;
+        const int pack = p->file_of[i];
+        int was_open;
+        uint8_t *b = read_entry(p, e, pack, &was_open);
+        if (!b && was_open) {
+            /* a pack kept open can stop reading (the memory card's handle gone stale after the Vita slept, or a
+             * read error): opened again, and the read tried once more, instead of the texture or level going
+             * missing for the rest of the run */
+            if (p->f[pack]) { fclose(p->f[pack]); p->f[pack] = NULL; }
+            b = read_entry(p, e, pack, &was_open);
+            if (b) nr_pak_reopened++;
         }
-        if (size) *size = e->size;
+        if (!b) return NULL;
+        if (size) *size = e->raw ? e->raw : e->size;
         return b;
     }
     return NULL;

@@ -3,10 +3,14 @@
 #ifdef NR_PC
 #include "pc_gl.h"
 #define sceGxmTransferFinish() ((void)0)
+#define sceKernelDelayThread(us) ((void)0)   /* (the PC's reads are done at once) */
 #else
 #include <vitaGL.h>
 #include <psp2/gxm.h>
+#include <psp2/kernel/threadmgr.h>
 #endif
+#include "io.h"
+#include "gfx.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,12 +147,9 @@ static void use(prog_t *p) { if (cur != p) { glUseProgram(p->p); cur = p; } }
 typedef struct { char name[48]; GLuint id; int w, h; } uitex;
 static uitex T[160]; static int nT;
 
-unsigned hud_tex(const char *name)
+/* a texture from its .nrt file's bytes (b: freed by the caller), cached under name; 0 and remembered as missing if bad */
+static GLuint tex_upload(const char *name, const uint8_t *b, uint32_t sz)
 {
-    for (int i = 0; i < nT; i++) if (!strcmp(T[i].name, name)) return T[i].id;
-    if (nT >= 160 || !g_pak || !name || !name[0]) return 0;
-    char p[96]; snprintf(p, sizeof p, "ui/%s.nrt", name);
-    uint32_t sz; uint8_t *b = nr_pak_read(g_pak, p, &sz);
     nr_texdata t;
     GLuint id = 0;
     if (b && !nr_tex_parse(b, sz, &t)) {
@@ -156,8 +157,8 @@ unsigned hud_tex(const char *name)
         if (t.fmt == 8) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, t.data);
         else {
             int w, h; uint32_t s = nr_tex_mip_size(&t, 0, &w, &h);
-            glCompressedTexImage2D(GL_TEXTURE_2D, 0, t.fmt == 1 ? GL_COMPRESSED_RGB_S3TC_DXT1_EXT : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, w, h, 0, s, t.data);
-            sceGxmTransferFinish();     /* see load_texture in gfx.c */
+            const uint8_t *lp[1] = { t.data };
+            gfx_give_dxt(id, name, t.fmt == 1, 1, lp, &s, &w, &h, 1, NULL);   /* (checked: see gfx.c) */
         }
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -167,8 +168,68 @@ unsigned hud_tex(const char *name)
     } else {
         snprintf(T[nT].name, sizeof T[nT].name, "%s", name); T[nT].id = 0; nT++;   /* remember the miss */
     }
+    return id;
+}
+static int tex_cached(const char *name, unsigned *id)
+{
+    for (int i = 0; i < nT; i++) if (!strcmp(T[i].name, name)) { *id = T[i].id; return 1; }
+    return 0;
+}
+
+/* the textures being read by the I/O thread (hud_tex_want) */
+typedef struct { char name[48]; int ticket; } uipend;
+static uipend PEND[8]; static int npend;
+
+unsigned hud_tex(const char *name)
+{
+    unsigned id;
+    if (!name || !name[0]) return 0;
+    if (tex_cached(name, &id)) return id;
+    if (nT >= 160 || !g_pak) return 0;
+    for (int i = 0; i < npend; i++) if (!strcmp(PEND[i].name, name)) {   /* (being read: wait for it) */
+        void *d = NULL; uint32_t n = 0;
+        while (!io_read_poll(PEND[i].ticket, &d, &n)) sceKernelDelayThread(1000);
+        PEND[i] = PEND[--npend];
+        id = tex_upload(name, d, n); free(d);
+        return id;
+    }
+    char p[96]; snprintf(p, sizeof p, "ui/%s.nrt", name);
+    uint32_t sz; uint8_t *b = nr_pak_read(g_pak, p, &sz);
+    id = tex_upload(name, b, sz);
     free(b);
     return id;
+}
+void hud_tex_want(const char *name)
+{
+    unsigned id;
+    if (!name || !name[0] || !g_pak || tex_cached(name, &id) || npend >= 8 || nT + npend >= 160) return;
+    for (int i = 0; i < npend; i++) if (!strcmp(PEND[i].name, name)) return;
+    char p[96]; snprintf(p, sizeof p, "ui/%s.nrt", name);
+    const char *path; uint32_t off, size;
+    int e = nr_pak_find(g_pak, p, &path, &off, &size);
+    if (e < 0) { tex_upload(name, NULL, 0); return; }         /* (remembered as missing) */
+    int t = io_read_start(path, off, size, g_pak->ents[e].raw);
+    if (t < 0) return;
+    snprintf(PEND[npend].name, sizeof PEND[npend].name, "%s", name); PEND[npend].ticket = t; npend++;
+}
+unsigned hud_tex_ready(const char *name)
+{
+    unsigned id;
+    if (!name || !name[0]) return 0;
+    if (tex_cached(name, &id)) return id;
+    hud_tex_want(name);
+    return 0;
+}
+void hud_tex_poll(void)
+{
+    for (int i = 0; i < npend; i++) {                     /* (one a frame: a picture's upload is about a millisecond) */
+        void *d = NULL; uint32_t n = 0;
+        if (!io_read_poll(PEND[i].ticket, &d, &n)) continue;
+        char name[48]; snprintf(name, sizeof name, "%s", PEND[i].name);
+        PEND[i] = PEND[--npend];
+        tex_upload(name, d, n); free(d);
+        return;
+    }
 }
 void hud_tex_size(unsigned tex, int *w, int *h)
 {
@@ -353,6 +414,31 @@ int hud_init(nr_pak *pak)
     if (b) F[1] = F[0];
     load_meshes(pak);
     make_icons();
+    /* each program drawn once with each blend state it is used with (an empty triangle): vitaGL makes a program's GPU
+     * code for a blend state the first time it draws with it, which mid-race was a hitch (the Tutorial's first text: a
+     * 35 ms frame) */
+    {
+        prog_t *PP[5] = { &P_TEX, &P_BTN, &P_HEAT, &P_LOAD, &P_COUNT };
+        static float z[3 * 8];
+        glBindBuffer(GL_ARRAY_BUFFER, 0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glEnableVertexAttribArray(0); glEnableVertexAttribArray(1); glEnableVertexAttribArray(2); glDisableVertexAttribArray(3);
+        glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); glDisable(GL_CULL_FACE);
+        for (int i = 0; i < 5; i++) {
+            if (!PP[i]->p) continue;
+            glUseProgram(PP[i]->p);
+            for (int b = 0; b < 3; b++) {
+                if (b == 0) glDisable(GL_BLEND);
+                else { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, b == 1 ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE); }
+                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 32, z);
+                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 32, z + 2);
+                glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 32, z + 4);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
+        }
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST); glEnableVertexAttribArray(3);
+        cur = NULL;
+    }
     return a;
 }
 

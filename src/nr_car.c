@@ -101,6 +101,8 @@ static void ensure_near(const nr_car *c, nr_coll *w)
     int ok = NS[k].w == w;
     for (int i = 0; i < 3 && ok; i++) if (c->pos[i] - 2.8f < NS[k].nb.lo[i] || c->pos[i] + 2.8f > NS[k].nb.hi[i]) ok = 0;
     if (!ok) gather_near(c, w, 0.5f + len3(c->vel) * 0.02f);
+    nr_coll_near_dyn(w, &NS[k].nb);
+    nr_coll_near_focus(&NS[k].nb, c->pos, 3.0f, 0.25f + len3(c->vel) * (2 * NR_CAR_DT));   /* (the queries' reach: 2.8, as above) */
 }
 
 /* ---- parameters */

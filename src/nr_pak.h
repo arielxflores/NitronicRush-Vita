@@ -18,6 +18,9 @@ int   nr_pak_open(nr_pak *p, const char *path);          /* 0 = ok */
 /* malloc'd copy of a file inside the pak (caller frees), NULL if missing */
 void *nr_pak_read(nr_pak *p, const char *name, uint32_t *size);
 void  nr_pak_close(nr_pak *p);
+extern int nr_pak_reopened;
+extern uint64_t (*nr_pak_clock)(void);                  /* (the loading report: the game's clock in us) */
+extern uint64_t nr_pak_read_us, nr_pak_unpack_us, nr_pak_bytes_read, nr_pak_bytes_unpacked;                            /* reads that worked only once their pack was opened again */
 /* index of the entry called name (or -1); its pack file path, offset and size go to the outputs */
 int   nr_pak_find(nr_pak *p, const char *name, const char **pack_path, uint32_t *off, uint32_t *size);
 #endif

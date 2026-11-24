@@ -2,12 +2,15 @@
 # (headless; it needs no window). See docs/testing.md.
 #   make -f Makefile.linux            -> build/nrpc
 #   make -f Makefile.linux ASAN=1     -> build/nrpc_asan (AddressSanitizer + UBSan)
+#   make -f Makefile.linux sndbench   -> build/sndbench (the sound mixer alone, replaying a recording)
+#   make -f Makefile.linux collbench  -> build/collbench (the level collision's sphere queries alone)
 # Needs gcc and the EGL / GLES 2 development files (Debian/Ubuntu: libegl-dev libgles-dev).
 CC      ?= gcc
 OUT     := build
+DEFL    := src/libdeflate/lib/deflate_decompress.c src/libdeflate/lib/utils.c src/libdeflate/lib/x86/cpu_features.c
 SRC     := tools/pc/nrpc.c vita/main.c vita/gfx.c vita/hud.c vita/front.c vita/save.c vita/snd.c \
-           vita/particles.c vita/camera.c vita/ghost.c vita/scores.c vita/chase.c vita/results.c vita/cinema.c vita/io.c \
-           src/nr_pak.c src/nr_objs.c src/nr_coll.c src/nr_car.c src/nr_data.c src/nr_tricks.c src/tinf/tinflate.c
+           vita/particles.c vita/camera.c vita/ghost.c vita/scores.c vita/chase.c vita/results.c vita/cinema.c vita/io.c vita/gputime.c \
+           src/nr_pak.c src/nr_objs.c src/nr_coll.c src/nr_car.c src/nr_data.c src/nr_tricks.c src/tinf/tinflate.c $(DEFL)
 CFLAGS  := -O1 -g -DNR_PC -DDATA='"data/"' -DNR_BUILD_LABEL='"pc"' -Itools/pc/shim -Itools/pc -Ivita -Isrc \
            -Wall -Wno-unused-function -Wno-misleading-indentation -Wno-unused-variable -Wno-unused-but-set-variable \
            $(EXTRA_CFLAGS)
@@ -19,11 +22,28 @@ else
 BIN     := $(OUT)/nrpc
 endif
 
-$(BIN): $(SRC) $(wildcard vita/*.h src/*.h tools/pc/*.h tools/pc/shim/*.h)
+CXX     ?= g++
+MOSRC   := simplifier allocator
+MESHOPT := $(MOSRC:%=vita/third_party/meshoptimizer/%.cpp)
+CXXFLAGS := -O2 -g -fno-exceptions -fno-rtti $(filter -fsanitize%,$(CFLAGS))
+
+$(BIN): $(SRC) $(MESHOPT) $(wildcard vita/*.h src/*.h tools/pc/*.h tools/pc/shim/*.h)
+	@mkdir -p $(OUT)/mo
+	for m in $(MOSRC); do $(CXX) $(CXXFLAGS) -c vita/third_party/meshoptimizer/$$m.cpp -o $(OUT)/mo/$$m.o || exit 1; done
+	$(CC) $(CFLAGS) $(SRC) $(MOSRC:%=$(OUT)/mo/%.o) -o $@ -rdynamic $(LIBS) -lm -lpthread -lstdc++
+
+sndbench: $(OUT)/sndbench
+$(OUT)/sndbench: tools/pc/sndbench.c vita/snd.c vita/snd.h src/nr_pak.c src/tinf/tinflate.c $(DEFL)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $(SRC) -o $@ -rdynamic $(LIBS) -lm -lpthread
+	$(CC) -O2 -ffast-math -g -DNR_PC -Ivita -Isrc -Wall -Wno-unused-function -Wno-misleading-indentation \
+	    tools/pc/sndbench.c src/nr_pak.c src/tinf/tinflate.c $(DEFL) -o $@ -lm
+
+collbench: $(OUT)/collbench
+$(OUT)/collbench: tools/pc/collbench.c src/nr_coll.c src/nr_coll.h src/nr_pak.c src/tinf/tinflate.c $(DEFL)
+	@mkdir -p $(OUT)
+	$(CC) -O2 -g -DNR_PC -Isrc tools/pc/collbench.c src/nr_coll.c src/nr_pak.c src/tinf/tinflate.c $(DEFL) -o $@ -lm
 
 clean:
-	rm -f $(OUT)/nrpc $(OUT)/nrpc_asan
+	rm -f $(OUT)/nrpc $(OUT)/nrpc_asan $(OUT)/sndbench $(OUT)/collbench
 
-.PHONY: clean
+.PHONY: clean sndbench

@@ -11,6 +11,7 @@
 #include "../src/nr_pak.h"
 
 #define GH_FILES 10
+#define GH_SHOWN 5                                    /* the local scores' ghosts raced against: the five fastest */
 
 int  gh_init(nr_pak *pak);                 /* models/ghosts.txt and the part models; 0 = ok */
 /* playback */
@@ -21,8 +22,16 @@ void gh_rewind(void);                      /* every replay back to its start, no
 void gh_start(void);                       /* GO: the replays run */
 void gh_labels_fade(int in);               /* the initials fade in (1, at GO) or out (0, at the player's finish) */
 void gh_update(float dt);                  /* each frame (dt 0 = paused): the ticks (playback, then the recording) */
+extern int gh_player_done;                 /* the player is past the finish line: the ghosts stopped at their runs' ends fade out */
 /* the ghosts' parts as draw objects (additive); dims the cars near the camera as the PC (needs VP) */
+void gh_preload(const char *name);          /* a blueprint's models and its results copy's, loaded now */
 int  gh_draw(gfx_obj *objs, int nobj, int max);
+extern float gh_merge_px;                   /* (ghosts within this many pixels of each other drawn as one; 0: the same place only) */
+void gh_view(const float eye[3], float ppu);
+void gh_log_spread(void (*out)(const char *));
+extern int gh_max_draw;                     /* (the bench: only the first that many ghosts drawn; 0 all) */
+int gh_is_model(const level_rt *m);         /* (a ghost car's part) */
+extern int gh_no_merge;                     /* (the bench: ghosts in the same place drawn one by one, black ones too) */
 void gh_draw_labels(float dt);             /* the initials, between hud_begin and hud_end */
 /* the recording */
 void gh_rec_reset(void);                   /* ResetRecording: empty, armed */

@@ -32,6 +32,11 @@ void  hud_loading_screen(unsigned tex, float t);
 /* textures from ui/<name>.nrt (cached); 0 if missing */
 unsigned hud_tex(const char *name);
 void  hud_tex_size(unsigned tex, int *w, int *h);
+/* without waiting: hud_tex_want starts reading one on the I/O thread; hud_tex_ready gives it if it is there (else asks
+ * for it and gives 0); hud_tex_poll, once a frame, makes the next one that has been read into a texture */
+void  hud_tex_want(const char *name);
+unsigned hud_tex_ready(const char *name);
+void  hud_tex_poll(void);
 void  hud_image(unsigned tex, float x, float y, float w, float h, unsigned rgba);
 void  hud_image_uv(unsigned tex, float x, float y, float w, float h, float u0, float v0, float u1, float v1, unsigned rgba);
 /* image centred on (cx, cy), scaled and rotated (radians) */

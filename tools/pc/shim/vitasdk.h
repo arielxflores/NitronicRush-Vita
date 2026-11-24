@@ -15,6 +15,7 @@ enum { SCE_CTRL_MODE_DIGITAL = 0, SCE_CTRL_MODE_ANALOG = 1, SCE_CTRL_MODE_ANALOG
 typedef enum { SCE_GXM_MULTISAMPLE_NONE = 0, SCE_GXM_MULTISAMPLE_2X = 1, SCE_GXM_MULTISAMPLE_4X = 2 } SceGxmMultisampleMode;
 typedef struct { int st_mode; unsigned int st_attr; int64_t st_size; } SceIoStat;
 #define SCE_KERNEL_CPU_MASK_USER_0 0x10000
+#define SCE_KERNEL_CPU_MASK_USER_1 0x20000
 int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count);
 typedef struct { unsigned char id, force; unsigned short x, y; unsigned char reserved[8]; unsigned short info; } SceTouchReport;
 typedef struct { uint64_t timeStamp; unsigned int status; unsigned int reportNum; SceTouchReport report[8]; } SceTouchData;

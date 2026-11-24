@@ -41,11 +41,21 @@ static int model_get(const char *name)
     if (nmodel >= 160) return -1;
     char p[80]; snprintf(p, sizeof p, "models/%s.nrl", name);
     snprintf(MODEL_NAME[nmodel], 48, "%s", name);
+    gfx_nrl_lod = 1;                                  /* (the ghost cars: with simpler shapes for far off) */
     if (!gfx_load_nrl(&MODELS[nmodel], PAK, p, name)) memset(&MODELS[nmodel], 0, sizeof MODELS[nmodel]);
+    gfx_nrl_lod = 0;
     nmodel++;
     return MODELS[nmodel - 1].nch ? nmodel - 1 : -1;
 }
 
+/* the models of a blueprint and of its "S" copy (the results' replay of this run) loaded now: the finish line copies
+ * the run as "S" blueprints, and loading their models there was a 40 ms hitch on the Vita */
+void gh_preload(const char *name)
+{
+    if (!name || !name[0] || !ndef) return;
+    char s[64]; snprintf(s, sizeof s, "%sS", name);
+    def_models(def_find(name)); def_models(def_find(s));
+}
 int gh_init(nr_pak *pak)
 {
     PAK = pak; ndef = 0;
@@ -99,6 +109,7 @@ typedef struct {
     int pilot;                                             /* autoplay drives the car along this replay: not drawn */
     int failed_obj;                                        /* its newest FailedReplayCar object (-1 none) */
     int car_obj;                                           /* its newest car object (-1 none) */
+    float fade;                                            /* stopped at the end of its run, once the player has finished: 1 -> 0 */
 } gh_file;
 #define MAX_FILES (GH_FILES + 24)              /* the ghosts, the self copies (20 at most), the pilot */
 static gh_file F[MAX_FILES]; static int nfile, nself, npilot;
@@ -131,7 +142,7 @@ static void file_rewind(gh_file *f)                       /* LF_Rewind 0x683230:
     for (int i = 0; i < f->nids; i++) obj_kill(f->obj[i]);
     for (int i = 0; i < MAX_IDS; i++) f->obj[i] = -1;
     f->nids = f->nfree = 0;
-    f->frame = 1; f->ai = f->ci = f->di = 0; f->state = 2; f->failed_obj = f->car_obj = -1;
+    f->frame = 1; f->ai = f->ci = f->di = 0; f->state = 2; f->failed_obj = f->car_obj = -1; f->fade = 1;
 }
 
 int gh_load(uint8_t *d, uint32_t sz, const char *initials)    /* RM_LoadGhostFile 0x6fea50 + LF_ReadBody 0x682b80 */
@@ -149,6 +160,9 @@ int gh_load(uint8_t *d, uint32_t sz, const char *initials)    /* RM_LoadGhostFil
     for (uint32_t i = 0; i < f->nN; i++) {
         NEED(4); uint32_t len = rd32(d + o); o += 4; NEED(len);
         char nm[64]; uint32_t k = len < 63 ? len : 63; memcpy(nm, d + o, k); nm[k] = 0; o += len;
+#ifdef NR_PC
+        if (getenv("GHOSTCAR") && !strcmp(nm, "CarGhost")) snprintf(nm, sizeof nm, "%s", getenv("GHOSTCAR"));   /* (another car's ghost body) */
+#endif
         if (i < 64) { f->namedef[i] = (int16_t)def_find(nm); def_models(f->namedef[i]); }
     }
 #undef NEED
@@ -521,9 +535,17 @@ static void interpolate(gh_obj *g, float a)                 /* RP_Interpolate 0x
     g->W[3][0] = g->W[3][1] = g->W[3][2] = 0; g->W[3][3] = 1;
 }
 
+/* The ghosts stopped at the end of their runs fade out once the player has crossed the line (the port's, not the PC's:
+ * there they stay until the level restarts). They stop just before the line, and the finish camera follows the car on
+ * through them: their bodies filled the screen in front of the car's warp-out, five times over each - six of them on
+ * warp_speed took the Vita's GPU 46 ms a frame for two seconds, where the view without them takes 11 */
+int gh_player_done;
+#define GH_FIN_FADE 0.4f
 void gh_update(float dt)                                    /* RM_Update 0x6ff320 */
 {
     if (dt <= 0) return;                                    /* paused: everything holds */
+    for (int i = 0; i < nfile; i++)
+        F[i].fade = !gh_player_done ? 1 : F[i].state == 4 && !F[i].self ? fmaxf(0, F[i].fade - fminf(dt, 0.1f) / GH_FIN_FADE) : F[i].fade;
     label_fade = fade_in ? fminf(label_fade + dt, 1) : fmaxf(label_fade - dt, 0);
     if (dt > 0.1f) dt = 0.1f;
     /* the cars' AnimBasic (State 2, 0..0.6 s at frame time): the wings open and fold */
@@ -584,9 +606,57 @@ static void dim_ghosts(void)
     }
 }
 
+/* ghosts in the very same place (the same blueprint, root matrix and wing timer: autoplay's runs, all the cars at GO)
+ * add up to one picture (additive), so they are drawn once with their colours added: the same pixels, a tenth of the
+ * work with ten. gh_no_merge: each one drawn (the bench, to compare) */
+int gh_no_merge, gh_max_draw;
+/* ghosts nearly in the same place (each driver's runs bunch up at the start: on Level 6 ten of them over each other cost
+ * the Vita 8 ms, their layers of glow blended one by one): drawn as one when they would land within gh_merge_px pixels of
+ * each other (their wings the same), their colours added - the picture within that of the one drawn each. 0: only the
+ * very same place. The camera from gh_view */
+float gh_merge_px;
+static float gh_eye[3], gh_ppu;
+void gh_view(const float eye[3], float ppu) { memcpy(gh_eye, eye, sizeof gh_eye); gh_ppu = ppu; }
+static float wing_f(const gh_part *p, float anim_t)
+{
+    float f = p->t1 > p->t0 ? (anim_t - p->t0) / (p->t1 - p->t0) : 0;
+    return f < 0 ? 0 : f > 1 ? 1 : f;
+}
+/* how far apart on screen (pixels) two ghosts of one blueprint would be drawn: the root's move plus its turn over the
+ * car's reach, at the nearer one's distance; 1e9 when their wings differ */
+static float gh_apart_px(const gh_obj *a, const gh_obj *b)
+{
+    const gh_def *d = &DEF[a->def];
+    for (int pi = 1; pi < d->nparts; pi++) if (fabsf(wing_f(&d->p[pi], a->anim_t) - wing_f(&d->p[pi], b->anim_t)) > 1e-4f) return 1e9f;
+    float mt = 0, mr = 0, da = 0, db = 0;
+    for (int r = 0; r < 3; r++) {
+        mt = fmaxf(mt, fabsf(a->W[r][3] - b->W[r][3]));
+        for (int c = 0; c < 3; c++) mr = fmaxf(mr, fabsf(a->W[r][c] - b->W[r][c]));
+        da += (a->W[r][3] - gh_eye[r]) * (a->W[r][3] - gh_eye[r]); db += (b->W[r][3] - gh_eye[r]) * (b->W[r][3] - gh_eye[r]);
+    }
+    float dist = sqrtf(fminf(da, db)) - 4.0f;                       /* (its nearest part: the car is about 4 units long) */
+    if (dist < 1.0f) dist = 1.0f;
+    return (mt * 1.7320508f + mr * 4.0f) * gh_ppu / dist;
+}
+void gh_log_spread(void (*out)(const char *))
+{
+    char l[400]; int n = snprintf(l, sizeof l, "ghost cars on screen from the first (pixels):"), first = -1, cnt = 0;
+    for (int i = 0; i < MAX_OBJS; i++) {
+        const gh_obj *g = &O[i];
+        if (!g->alive || g->def < 0 || F[g->file].state < 3 || g->first || F[g->file].pilot || F[g->file].self) continue;
+        if (first < 0) { first = i; continue; }
+        cnt++;
+        if (n < (int)sizeof l - 16) n += snprintf(l + n, sizeof l - n, " %.1f", O[first].def == g->def ? gh_apart_px(&O[first], g) : -1.0f);
+    }
+    if (first >= 0) out(l);
+}
+int gh_is_model(const level_rt *m) { return m >= MODELS && m < MODELS + 160; }
 int gh_draw(gfx_obj *objs, int nobj, int max)
 {
     dim_ghosts();
+    int ndrawn = 0;                                    /* (gh_max_draw: the bench, the first that many ghosts only) */
+    struct { int obj, first, n; signed char part[MAX_PARTS]; } M[MAX_FILES]; int nm = 0;   /* drawn ghosts that others may join */
+    const int nobj0 = nobj;
     for (int i = 0; i < MAX_OBJS && nobj < max; i++) {
         gh_obj *g = &O[i];
         if (!g->alive || g->def < 0 || F[g->file].state < 3 || g->first || F[g->file].pilot) continue;
@@ -595,9 +665,45 @@ int gh_draw(gfx_obj *objs, int nobj, int max)
         /* the colour bytes (RenderMesh +0x60..+0x62), the glow byte a x 10 -> x 0.1 */
         float cb[3] = { (int)(col[0] * 255) / 255.0f, (int)(col[1] * 255) / 255.0f, (int)(col[2] * 255) / 255.0f };
         float glow = (int)(col[3] * 10) * 0.1f;
-        float k = 1;
-        if (g->label) { k = (g->cw - 1) / 6; k = k < 0 ? 0 : k > 1 ? 1 : k; k /= g->count > 1 ? g->count : 1; }
+        /* DimGhosts: the body's colour bytes = (int)(colour x k / count x 255) - whole bytes, as the PC sets them */
+        float bc[3] = { cb[0], cb[1], cb[2] };
+        if (g->label) {
+            float k = (g->cw - 1) / 6; k = k < 0 ? 0 : k > 1 ? 1 : k;
+            float n = g->count > 1 ? g->count : 1;
+            for (int c = 0; c < 3; c++) bc[c] = (int)(cb[c] * k / n * 255) / 255.0f;
+        }
+        const int self = F[g->file].self;
+        const float fk = self ? 1 : F[g->file].fade;
+        if (fk <= 0) continue;                             /* (faded out after the finish: nothing to draw) */
+        if (fk < 1) for (int c = 0; c < 3; c++) { cb[c] *= fk; bc[c] *= fk; }
+#ifdef NR_PC
+        if (getenv("GHCW") && F[g->file].state == 4) { static int c; if (++c < 400 && c % 5 == 0) fprintf(stderr, "GHCW obj %d file %d state %d label %d cw %.2f count %.2f k %.2f\n", i, g->file, F[g->file].state, g->label, g->cw, g->count, (g->cw - 1) / 6); }
+#endif
+        if (gh_max_draw && !self && ndrawn++ >= gh_max_draw) continue;
+        /* the same place as one drawn before: its colours added to that one's */
+        int join = -1;
+        if (!self && !gh_no_merge)
+            for (int m = 0; m < nm && join < 0; m++) {
+                const gh_obj *h = &O[M[m].obj];
+                if (h->def == g->def && ((h->anim_t == g->anim_t && !memcmp(h->W, g->W, sizeof g->W))
+                                         || (gh_merge_px > 0 && gh_ppu > 0 && gh_apart_px(h, g) < gh_merge_px))) join = m;
+            }
+#ifdef NR_PC
+        if (getenv("GHDBG") && nm) { static int c; if (++c < 40) { const gh_obj *h = &O[M[0].obj];
+            fprintf(stderr, "GHDBG obj %d file %d def %d/%d anim %g/%g W03 %.9g/%.9g W00 %.9g/%.9g same %d join %d\n", i, g->file, g->def, h->def, g->anim_t, h->anim_t, g->W[0][3], h->W[0][3], g->W[0][0], h->W[0][0], !memcmp(h->W, g->W, sizeof g->W), join); } }
+#endif
+        if (join >= 0) {
+            for (int k = 0; k < M[join].n; k++) {
+                gfx_obj *o = &objs[M[join].first + k];
+                const float *c = M[join].part[k] == 0 ? bc : cb;
+                /* (as one colour with glow 1: the shader multiplies colour by glow, so the sum is the same) */
+                if (o->col[3] != 1) { for (int q = 0; q < 3; q++) o->col[q] *= o->col[3]; o->col[3] = 1; }
+                for (int q = 0; q < 3; q++) o->col[q] += c[q] * glow;
+            }
+            continue;
+        }
         float PW[MAX_PARTS][4][4];
+        int first = nobj; signed char parts[MAX_PARTS];
         for (int pi = 0; pi < d->nparts; pi++) {
             const gh_part *p = &d->p[pi];
             if (pi == 0) memcpy(PW[0], g->W, sizeof g->W);
@@ -619,13 +725,24 @@ int gh_draw(gfx_obj *objs, int nobj, int max)
             if (p->model < 0 || nobj >= max) continue;
             gfx_obj *o = &objs[nobj++]; memset(o, 0, sizeof *o);
             o->model = &MODELS[p->model]; memcpy(o->m, PW[pi], sizeof o->m);
-            if (F[g->file].self) continue;                 /* (the self copies keep their blueprint's look: car_dead, Color1) */
+            parts[nobj - 1 - first] = (signed char)pi;
+            if (self) continue;                            /* (the self copies keep their blueprint's look: car_dead, Color1) */
             o->use_col = 1;
-            float kk = pi == 0 ? k : 1;                    /* only the body is dimmed, not its wings */
-            o->col[0] = cb[0] * kk; o->col[1] = cb[1] * kk; o->col[2] = cb[2] * kk; o->col[3] = glow;
+            const float *c = pi == 0 ? bc : cb;            /* only the body is dimmed, not its wings */
+            o->col[0] = c[0]; o->col[1] = c[1]; o->col[2] = c[2]; o->col[3] = glow;
         }
+        if (!self && nm < MAX_FILES) { M[nm].obj = i; M[nm].first = first; M[nm].n = nobj - first; memcpy(M[nm].part, parts, sizeof parts); nm++; }
     }
-    return nobj;
+    /* a part whose colour is black adds nothing (additive): left out (a body faded out near the camera) */
+    if (gh_no_merge) return nobj;
+    int w = nobj0;
+    for (int r = nobj0; r < nobj; r++) {
+        const gfx_obj *o = &objs[r];
+        if (o->use_col && o->col[0] <= 0 && o->col[1] <= 0 && o->col[2] <= 0) continue;
+        if (w != r) objs[w] = *o;
+        w++;
+    }
+    return w;
 }
 
 /* PlayerName (0x6fe510, 0x6fde70): the initials above each ghost car, faded and sized by distance,
@@ -675,7 +792,7 @@ void gh_draw_labels(float dt)
         if (l->al < 0.1f) continue;
         if (g->hold > 0) g->hold -= dt;
         else if (g->off > 0) g->off = fmaxf(0, g->off - fmaxf(MinS * KS * 3.5f, l->s) * dt * 0.2f);
-        float a = l->al * label_fade;
+        float a = l->al * label_fade * F[g->file].fade;
         if (a <= 0.004f) continue;
         const float *c = F[g->file].col;
         unsigned r = (unsigned)(fminf(1, c[0] + 0.2f) * 255), gg = (unsigned)(fminf(1, c[1] + 0.2f) * 255), b = (unsigned)(fminf(1, c[2] + 0.2f) * 255);
